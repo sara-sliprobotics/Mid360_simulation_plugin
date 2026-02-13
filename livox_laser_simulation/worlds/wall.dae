@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <created>2026-02-13T00:00:00</created>
+    <modified>2026-02-13T00:00:00</modified>
+  </asset>
+  <library_geometries>
+    <geometry id="wall_mesh" name="wall_mesh">
+      <mesh>
+        <source id="wall_mesh-positions">
+          <float_array id="wall_mesh-positions-array" count="24">
+            -0.1 -2.5 0    0.1 -2.5 0    0.1 2.5 0    -0.1 2.5 0
+            -0.1 -2.5 2.5  0.1 -2.5 2.5  0.1 2.5 2.5  -0.1 2.5 2.5
+          </float_array>
+          <technique_common>
+            <accessor source="#wall_mesh-positions-array" count="8" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <vertices id="wall_mesh-vertices">
+          <input semantic="POSITION" source="#wall_mesh-positions"/>
+        </vertices>
+        <triangles count="12">
+          <input semantic="VERTEX" source="#wall_mesh-vertices" offset="0"/>
+          <p>0 1 2 0 2 3 4 7 6 4 6 5 0 4 5 0 5 1 1 5 6 1 6 2 2 6 7 2 7 3 4 0 3 4 3 7</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="Wall" name="Wall">
+        <instance_geometry url="#wall_mesh"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene>
+    <instance_visual_scene url="#Scene"/>
+  </scene>
+</COLLADA>
