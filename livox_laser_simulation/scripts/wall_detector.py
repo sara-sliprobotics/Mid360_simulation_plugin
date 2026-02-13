@@ -8,7 +8,7 @@ class WallDetector:
     """Detects walls from point cloud data using RANSAC plane segmentation"""
     
     def __init__(self, voxel_size=0.05, distance_threshold=0.1, min_points=200, 
-                 vertical_threshold=0.2, ransac_n=3, num_iterations=1000):
+                 vertical_threshold=0.2, ransac_n=3, num_iterations=1000, min_wall_width=2.0):
         """
         Initialize wall detector with parameters
         
@@ -19,6 +19,7 @@ class WallDetector:
             vertical_threshold: Maximum vertical component of normal for walls
             ransac_n: Number of points for RANSAC
             num_iterations: RANSAC iterations
+            min_wall_width: Minimum width for a plane to be considered a wall (m)
         """
         self.voxel_size = voxel_size
         self.distance_threshold = distance_threshold
@@ -26,6 +27,7 @@ class WallDetector:
         self.vertical_threshold = vertical_threshold
         self.ransac_n = ransac_n
         self.num_iterations = num_iterations
+        self.min_wall_width = min_wall_width
     
     def detect(self, points):
         """
@@ -80,16 +82,25 @@ class WallDetector:
             if abs(c) < self.vertical_threshold:  
                 # It is a Wall!
                 wall_pcd = cloud.select_by_index(inliers)
-                
-                # Store wall information
                 wall_points = np.asarray(wall_pcd.points)
-                wall_info = {
-                    'plane_model': plane_model,
-                    'points': wall_points,
-                    'num_points': len(inliers),
-                    'normal': np.array([a, b, c])
-                }
-                walls.append(wall_info)
+                
+                # Check wall dimensions - reject if too narrow
+                min_pt = np.min(wall_points, axis=0)
+                max_pt = np.max(wall_points, axis=0)
+                width_x = max_pt[0] - min_pt[0]
+                width_y = max_pt[1] - min_pt[1]
+                max_width = max(width_x, width_y)
+                
+                # Only keep if wide enough to be a real wall
+                if max_width >= self.min_wall_width:
+                    # Store wall information
+                    wall_info = {
+                        'plane_model': plane_model,
+                        'points': wall_points,
+                        'num_points': len(inliers),
+                        'normal': np.array([a, b, c])
+                    }
+                    walls.append(wall_info)
             
             # 5. Remove the points we just found (Wall OR Floor)
             # Whether it was a wall or a floor, we remove it so we can find the NEXT plane.

@@ -50,3 +50,18 @@ add_library(livox_laser_simulation SHARED src/livox_points_plugin.cpp src/livox_
 target_link_libraries(livox_laser_simulation ${catkin_LIBRARIES} RayPlugin)
 
 target_link_libraries(livox_laser_simulation libprotobuf.so.9)
+
+# Install Python scripts with executable permissions
+catkin_install_python(PROGRAMS
+  scripts/object_detection.py
+  scripts/leg_detector.py
+  scripts/wall_detector.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# Install Python dependencies
+find_package(PythonInterp 3 REQUIRED)
+add_custom_target(install_python_deps ALL
+  COMMAND ${PYTHON_EXECUTABLE} -m pip install -r ${CMAKE_CURRENT_SOURCE_DIR}/requirements.txt
+  COMMENT "Installing Python dependencies from requirements.txt"
+)

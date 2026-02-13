@@ -9,68 +9,26 @@
     </include>
     
     <!-- Wall in front (positive X direction) -->
-    <model name="front_wall">
-      <pose>3 0 1.25  0 0 0</pose>
-      <static>true</static>
-      <link name="wall_link">
-        <visual name="visual">
-          <geometry>
-            <box>
-              <size>0.2 5 2.5</size>
-            </box>
-          </geometry>
-        </visual>
-        <collision name="collision">
-          <geometry>
-            <box>
-              <size>0.2 5 2.5</size>
-            </box>
-          </geometry>
-        </collision>
-      </link>
-    </model>
+    <include>
+      <uri>model://simple_wall</uri>
+      <name>front_wall</name>
+      <pose>5 0 1.25  0 0 0</pose>
+    </include>
     
-    <!-- Person at back (negative X direction) -->
-    <model name="person_standing">
-      <pose>-2 0 0  0 0 0</pose>
-      <static>true</static>
-      <link name="person_link">
-        <visual name="body">
-          <pose>0 0 0.85 0 0 0</pose>
-          <geometry>
-            <cylinder>
-              <radius>0.2</radius>
-              <length>0.9</length>
-            </cylinder>
-          </geometry>
-        </visual>
-        <visual name="head">
-          <pose>0 0 1.55 0 0 0</pose>
-          <geometry>
-            <sphere>
-              <radius>0.15</radius>
-            </sphere>
-          </geometry>
-        </visual>
-        <visual name="legs">
-          <pose>0 0 0.3 0 0 0</pose>
-          <geometry>
-            <box>
-              <size>0.15 0.3 0.6</size>
-            </box>
-          </geometry>
-        </visual>
-        <collision name="collision">
-          <pose>0 0 0.85 0 0 0</pose>
-          <geometry>
-            <cylinder>
-              <radius>0.25</radius>
-              <length>1.7</length>
-            </cylinder>
-          </geometry>
-        </collision>
-      </link>
-    </model>
+    <!-- Truck at back (negative X direction) -->
+    <include>
+      <uri>model://truck</uri>
+      <name>truck_model</name>
+      <pose>-10 0 0  0 0 1.5708</pose>
+    </include>
+    
+    <!-- Tray -->
+    <include>
+      <uri>model://tray</uri>
+      <name>tray_model</name>
+      <pose>0 -4 0  0 0 0</pose>
+    </include>
     
   </world>
 </sdf>
+

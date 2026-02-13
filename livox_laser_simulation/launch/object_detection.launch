@@ -1,6 +1,9 @@
 <?xml version="1.0" ?>
 <launch>
 
+	<!-- Set Gazebo model path to include our custom models -->
+	<env name="GAZEBO_MODEL_PATH" value="$(find livox_laser_simulation)/models:$(optenv GAZEBO_MODEL_PATH)" />
+
 	<!-- This is where we select the model file for the UAV-->
 	<arg name="UAV_model" value="$(find livox_laser_simulation)/models/sensors_only/model.sdf" />
 	<!-- This is where we set the initial position of the UAV-->

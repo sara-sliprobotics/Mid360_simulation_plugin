@@ -3,9 +3,18 @@
 import rospy
 import numpy as np
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 import sensor_msgs.point_cloud2 as pc2
+import json
+import sys
+import os
+
+# Add script directory to path for imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 
 from leg_detector import LegDetector
 from wall_detector import WallDetector
@@ -29,6 +38,7 @@ class LivoxObjectDetector:
         wall_distance_threshold = rospy.get_param('~wall_distance_threshold', 0.1)
         wall_min_points = rospy.get_param('~wall_min_points', 200)
         wall_vertical_threshold = rospy.get_param('~wall_vertical_threshold', 0.2)
+        wall_min_width = rospy.get_param('~wall_min_width', 2.0)
         
         # Initialize detectors
         self.leg_detector = LegDetector(
@@ -44,7 +54,8 @@ class LivoxObjectDetector:
             voxel_size=wall_voxel_size,
             distance_threshold=wall_distance_threshold,
             min_points=wall_min_points,
-            vertical_threshold=wall_vertical_threshold
+            vertical_threshold=wall_vertical_threshold,
+            min_wall_width=wall_min_width
         )
         
         # Subscriber
@@ -52,6 +63,7 @@ class LivoxObjectDetector:
         
         # Publishers
         self.marker_pub = rospy.Publisher('/livox/detected_objects', MarkerArray, queue_size=10)
+        self.detection_pub = rospy.Publisher('/livox/detections', String, queue_size=10)
         
         rospy.loginfo("Livox Object Detector initialized with Leg and Wall Detection")
         rospy.loginfo(f"Leg height: {leg_height_min}-{leg_height_max}m, width: {leg_width_min}-{leg_width_max}m")
@@ -73,6 +85,9 @@ class LivoxObjectDetector:
             # Detect walls using wall detector
             walls = self.wall_detector.detect(points)
             
+            # Publish detection results as structured data
+            self.publish_detections(human_locations, walls, msg.header)
+            
             # Visualize detected humans and walls
             self.visualize_detections(human_locations, walls, msg.header)
             
@@ -89,6 +104,61 @@ class LivoxObjectDetector:
             points_list.append([point[0], point[1], point[2]])
         
         return np.array(points_list)
+    
+    def publish_detections(self, human_locations, walls, header):
+        """Publish structured detection results as JSON"""
+        detections = {
+            'timestamp': header.stamp.to_sec(),
+            'frame_id': header.frame_id,
+            'humans': [],
+            'walls': []
+        }
+        
+        # Add human detections
+        for i, center in enumerate(human_locations):
+            detections['humans'].append({
+                'id': i,
+                'type': 'human',
+                'position': {
+                    'x': float(center[0]),
+                    'y': float(center[1]),
+                    'z': float(center[2])
+                }
+            })
+        
+        # Add wall detections
+        for i, wall in enumerate(walls):
+            wall_points = wall['points']
+            min_pt = np.min(wall_points, axis=0)
+            max_pt = np.max(wall_points, axis=0)
+            center = (min_pt + max_pt) / 2.0
+            size = max_pt - min_pt
+            
+            detections['walls'].append({
+                'id': i,
+                'type': 'wall',
+                'center': {
+                    'x': float(center[0]),
+                    'y': float(center[1]),
+                    'z': float(center[2])
+                },
+                'size': {
+                    'x': float(size[0]),
+                    'y': float(size[1]),
+                    'z': float(size[2])
+                },
+                'normal': {
+                    'x': float(wall['normal'][0]),
+                    'y': float(wall['normal'][1]),
+                    'z': float(wall['normal'][2])
+                },
+                'num_points': wall['num_points']
+            })
+        
+        # Publish as JSON string
+        msg = String()
+        msg.data = json.dumps(detections, indent=2)
+        self.detection_pub.publish(msg)
     
     def visualize_detections(self, human_locations, walls, header):
         """Publish visualization markers for detected humans and walls"""
