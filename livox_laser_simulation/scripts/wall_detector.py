@@ -8,7 +8,8 @@ class WallDetector:
     """Detects walls from point cloud data using RANSAC plane segmentation"""
     
     def __init__(self, voxel_size=0.05, distance_threshold=0.1, min_points=200, 
-                 vertical_threshold=0.2, ransac_n=3, num_iterations=1000, min_wall_width=2.0):
+                 vertical_threshold=0.2, ransac_n=3, num_iterations=1000, min_wall_width=2.0,
+                 connectivity_eps=0.5):
         """
         Initialize wall detector with parameters
         
@@ -20,6 +21,7 @@ class WallDetector:
             ransac_n: Number of points for RANSAC
             num_iterations: RANSAC iterations
             min_wall_width: Minimum width for a plane to be considered a wall (m)
+            connectivity_eps: Max distance for spatial clustering to separate disconnected objects (m)
         """
         self.voxel_size = voxel_size
         self.distance_threshold = distance_threshold
@@ -28,6 +30,7 @@ class WallDetector:
         self.ransac_n = ransac_n
         self.num_iterations = num_iterations
         self.min_wall_width = min_wall_width
+        self.connectivity_eps = connectivity_eps
     
     def detect(self, points):
         """
@@ -82,7 +85,17 @@ class WallDetector:
             if abs(c) < self.vertical_threshold:  
                 # It is a Wall!
                 wall_pcd = cloud.select_by_index(inliers)
-                wall_points = np.asarray(wall_pcd.points)
+                
+                # CRITICAL: Check spatial connectivity to avoid merging wall + separated objects
+                # Even if they fit the same plane equation, they should be separate if not connected
+                main_cluster = self._get_largest_connected_cluster(wall_pcd)
+                
+                if len(main_cluster.points) < self.min_points:
+                    # After filtering, not enough points - skip this plane
+                    cloud = cloud.select_by_index(inliers, invert=True)
+                    continue
+                
+                wall_points = np.asarray(main_cluster.points)
                 
                 # Check wall dimensions - reject if too narrow
                 min_pt = np.min(wall_points, axis=0)
@@ -97,7 +110,7 @@ class WallDetector:
                     wall_info = {
                         'plane_model': plane_model,
                         'points': wall_points,
-                        'num_points': len(inliers),
+                        'num_points': len(wall_points),
                         'normal': np.array([a, b, c])
                     }
                     walls.append(wall_info)
@@ -107,3 +120,42 @@ class WallDetector:
             cloud = cloud.select_by_index(inliers, invert=True)
         
         return walls
+    
+    def _get_largest_connected_cluster(self, pcd):
+        """
+        Use DBSCAN to find spatially connected clusters and return the largest one.
+        This separates objects that fit the same plane but are disconnected (wall + tray).
+        
+        Args:
+            pcd: Open3D PointCloud
+            
+        Returns:
+            Open3D PointCloud containing only the largest connected cluster
+        """
+        # Cluster points spatially using DBSCAN
+        labels = np.array(pcd.cluster_dbscan(eps=self.connectivity_eps, min_points=5))
+        
+        # If no valid clusters or all noise, return original
+        if labels.size == 0 or np.all(labels < 0):
+            return pcd
+        
+        # Find largest cluster (ignoring noise points with label -1)
+        unique_labels = np.unique(labels)
+        valid_labels = unique_labels[unique_labels >= 0]
+        
+        if len(valid_labels) == 0:
+            return pcd
+        
+        # Count points in each cluster and get the largest
+        largest_cluster_label = None
+        largest_cluster_size = 0
+        
+        for label in valid_labels:
+            cluster_size = np.sum(labels == label)
+            if cluster_size > largest_cluster_size:
+                largest_cluster_size = cluster_size
+                largest_cluster_label = label
+        
+        # Extract only the largest cluster
+        largest_cluster_indices = np.where(labels == largest_cluster_label)[0]
+        return pcd.select_by_index(largest_cluster_indices)
