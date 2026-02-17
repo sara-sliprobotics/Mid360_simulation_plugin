@@ -16,23 +16,17 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
-from leg_detector import LegDetector
 from wall_detector import WallDetector
 from truck_detector import TruckDetector
+from person_detector import PersonDetector
 
 
 class LivoxObjectDetector:
     def __init__(self):
         rospy.init_node('livox_object_detector', anonymous=True)
         
-        # Parameters for leg detection
+        # Parameters
         self.min_points = rospy.get_param('~min_points', 50)
-        leg_height_min = rospy.get_param('~leg_height_min', 0.1)
-        leg_height_max = rospy.get_param('~leg_height_max', 0.5)
-        leg_width_min = rospy.get_param('~leg_width_min', 0.08)
-        leg_width_max = rospy.get_param('~leg_width_max', 0.25)
-        dbscan_eps = rospy.get_param('~dbscan_eps', 0.10)
-        dbscan_min_samples = rospy.get_param('~dbscan_min_samples', 10)
         
         # Parameters for wall detection
         wall_voxel_size = rospy.get_param('~wall_voxel_size', 0.05)
@@ -45,17 +39,14 @@ class LivoxObjectDetector:
         truck_width = rospy.get_param('~truck_width', 2.6)
         truck_width_tolerance = rospy.get_param('~truck_width_tolerance', 0.3)
         truck_min_wall_length = rospy.get_param('~truck_min_wall_length', 3.0)
+        
+        # Parameters for person detection
+        person_min_height = rospy.get_param('~person_min_height', 1.30)  # Lowered from 1.40
+        person_max_width = rospy.get_param('~person_max_width', 0.80)
+        person_min_points = rospy.get_param('~person_min_points', 30)  # Lowered from 50
+        person_eps = rospy.get_param('~person_eps', 0.35)  # Increased from 0.25
 
         # Initialize detectors
-        self.leg_detector = LegDetector(
-            height_min=leg_height_min,
-            height_max=leg_height_max,
-            width_min=leg_width_min,
-            width_max=leg_width_max,
-            eps=dbscan_eps,
-            min_samples=dbscan_min_samples
-        )
-        
         self.wall_detector = WallDetector(
             voxel_size=wall_voxel_size,
             distance_threshold=wall_distance_threshold,
@@ -69,48 +60,82 @@ class LivoxObjectDetector:
             width_tolerance=truck_width_tolerance,
             min_wall_length=truck_min_wall_length
         )
+        
+        self.person_detector = PersonDetector(
+            min_human_height=person_min_height,
+            max_human_width=person_max_width,
+            min_points=person_min_points,
+            eps=person_eps
+        )
 
-        # Subscriber
-        self.pc_sub = rospy.Subscriber('/livox/lidar', PointCloud2, self.pointcloud_callback)
+        # Subscriber - use queue_size=1 to only process latest, drop old messages
+        # Large buff_size to handle large point cloud messages
+        self.pc_sub = rospy.Subscriber('/livox/lidar', PointCloud2, self.pointcloud_callback, 
+                                       queue_size=1, buff_size=2**24)
         
         # Publishers
         self.marker_pub = rospy.Publisher('/livox/detected_objects', MarkerArray, queue_size=10)
         self.detection_pub = rospy.Publisher('/livox/detections', String, queue_size=10)
         
-        rospy.loginfo("Livox Object Detector initialized with Leg, Wall, and Truck Detection")
-        rospy.loginfo(f"Leg height: {leg_height_min}-{leg_height_max}m, width: {leg_width_min}-{leg_width_max}m")
+        rospy.loginfo("Livox Object Detector initialized with Wall, Truck, and Person Detection")
         rospy.loginfo(f"Wall detection: voxel={wall_voxel_size}m, min_points={wall_min_points}")
         rospy.loginfo(f"Truck detection: width={truck_width}m ± {truck_width_tolerance}m")
+        rospy.loginfo(f"Person detection: height>={person_min_height}m, width<={person_max_width}m")
     
     def pointcloud_callback(self, msg):
         """Process incoming point cloud data"""
         try:
+            import time
+            callback_start = time.time()
+            
+            # Debug: Check incoming message timestamp and timing
+            now = rospy.Time.now()
+            pc_age = (now - msg.header.stamp).to_sec()
+            rospy.loginfo_throttle(1.0, f"Point cloud age: {pc_age:.3f}s, PC time: {msg.header.stamp.to_sec():.3f}, Now: {now.to_sec():.3f}")
+            
             # Convert PointCloud2 to numpy array
+            convert_start = time.time()
             points = self.pointcloud2_to_array(msg)
+            convert_time = time.time() - convert_start
             
             if len(points) < self.min_points:
                 rospy.logwarn_throttle(5.0, f"Too few points: {len(points)}")
                 return
             
-            # Detect legs using leg detector
-            human_locations = self.leg_detector.detect(points)
-
             # Detect walls using wall detector
+            wall_start = time.time()
             walls = self.wall_detector.detect(points)
+            wall_time = time.time() - wall_start
             
             # Detect trucks from wall pairs
+            truck_start = time.time()
             trucks = self.truck_detector.detect(walls)
+            truck_time = time.time() - truck_start
+            
+            # Detect persons using person detector
+            person_start = time.time()
+            persons = self.person_detector.detect(self.numpy_to_open3d(points))
+            person_time = time.time() - person_start
 
             # Publish detection results as structured data
-            self.publish_detections(human_locations, walls, trucks, msg.header)
+            publish_start = time.time()
+            self.publish_detections(walls, trucks, persons, msg.header)
+            publish_time = time.time() - publish_start
 
-            # Visualize detected humans, walls, and trucks
-            self.visualize_detections(human_locations, walls, trucks, msg.header)
+            # Visualize detected walls, trucks, and persons
+            viz_start = time.time()
+            self.visualize_detections(walls, trucks, persons, msg.header)
+            viz_time = time.time() - viz_start
+            
+            total_time = time.time() - callback_start
 
-            rospy.loginfo_throttle(1.0, f"Detected {len(human_locations)} human(s), {len(walls)} wall(s), and {len(trucks)} truck(s)")
+            rospy.loginfo_throttle(1.0, f"Processing times - Convert: {convert_time:.3f}s, Wall: {wall_time:.3f}s, Truck: {truck_time:.3f}s, Person: {person_time:.3f}s, Publish: {publish_time:.3f}s, Viz: {viz_time:.3f}s, TOTAL: {total_time:.3f}s")
+            rospy.loginfo_throttle(1.0, f"Detected {len(persons)} person(s), {len(walls)} wall(s), {len(trucks)} truck(s)")
             
         except Exception as e:
+            import traceback
             rospy.logerr(f"Error processing point cloud: {e}")
+            rospy.logerr(traceback.format_exc())
     
     def pointcloud2_to_array(self, cloud_msg):
         """Convert PointCloud2 message to numpy array"""
@@ -121,27 +146,24 @@ class LivoxObjectDetector:
         
         return np.array(points_list)
     
-    def publish_detections(self, human_locations, walls, trucks, header):
+    def numpy_to_open3d(self, points):
+        """Convert numpy array to Open3D PointCloud"""
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        return pcd
+    
+    def publish_detections(self, walls, trucks, persons, header):
         """Publish structured detection results as JSON"""
+        now = rospy.Time.now()
         detections = {
             'timestamp': header.stamp.to_sec(),
+            'published_at': now.to_sec(),
             'frame_id': header.frame_id,
-            'humans': [],
             'walls': [],
-            'trucks': []
+            'trucks': [],
+            'persons': []
         }
-        
-        # Add human detections
-        for i, center in enumerate(human_locations):
-            detections['humans'].append({
-                'id': i,
-                'type': 'human',
-                'position': {
-                    'x': float(center[0]),
-                    'y': float(center[1]),
-                    'z': float(center[2])
-                }
-            })
         
         # Add wall detections
         for i, wall in enumerate(walls):
@@ -190,96 +212,38 @@ class LivoxObjectDetector:
                 },
                 'wall_indices': truck['wall_pair']
             })
+        
+        # Add person detections
+        for i, person in enumerate(persons):
+            detections['persons'].append({
+                'id': i,
+                'type': 'person',
+                'center': {
+                    'x': float(person['center'][0]),
+                    'y': float(person['center'][1]),
+                    'z': float(person['center'][2])
+                },
+                'height': person['height'],
+                'width': person['width'],
+                'num_points': person['points']
+            })
 
         # Publish as JSON string
         msg = String()
         msg.data = json.dumps(detections, indent=2)
         self.detection_pub.publish(msg)
     
-    def visualize_detections(self, human_locations, walls, trucks, header):
-        """Publish visualization markers for detected humans and walls"""
+    def visualize_detections(self, walls, trucks, persons, header):
+        """Publish visualization markers for detected walls, trucks, and persons"""
         marker_array = MarkerArray()
-        marker_id = 0
         
-        # Visualize humans
-        for i, center in enumerate(human_locations):
-            # Cylinder marker for human (approximate height)
-            marker = Marker()
-            marker.header = header
-            marker.ns = "detected_humans"
-            marker.id = marker_id
-            marker_id += 1
-            marker.type = Marker.CYLINDER
-            marker.action = Marker.ADD
-            
-            # Position (center of detected leg at ground level, extend upward)
-            marker.pose.position.x = center[0]
-            marker.pose.position.y = center[1]
-            marker.pose.position.z = 0.85  # Approximate torso center
-            marker.pose.orientation.w = 1.0
-            
-            # Size (approximate human dimensions)
-            marker.scale.x = 0.4  # Width
-            marker.scale.y = 0.4  # Depth
-            marker.scale.z = 1.7  # Height
-            
-            # Color (green for human)
-            marker.color.r = 0.0
-            marker.color.g = 1.0
-            marker.color.b = 0.0
-            marker.color.a = 0.5
-            marker.lifetime = rospy.Duration(0.5)
-            
-            marker_array.markers.append(marker)
-            
-            # Text label at detected leg position
-            text_marker = Marker()
-            text_marker.header = header
-            text_marker.ns = "human_labels"
-            text_marker.id = marker_id
-            marker_id += 1
-            text_marker.type = Marker.TEXT_VIEW_FACING
-            text_marker.action = Marker.ADD
-            
-            text_marker.pose.position.x = center[0]
-            text_marker.pose.position.y = center[1]
-            text_marker.pose.position.z = 1.8  # Above head
-            
-            text_marker.text = f"Human\n({center[0]:.1f}, {center[1]:.1f})"
-            text_marker.scale.z = 0.2
-            text_marker.color.r = 1.0
-            text_marker.color.g = 1.0
-            text_marker.color.b = 1.0
-            text_marker.color.a = 1.0
-            text_marker.lifetime = rospy.Duration(0.5)
-            
-            marker_array.markers.append(text_marker)
-            
-            # Sphere marker at detected leg position (exact location)
-            sphere_marker = Marker()
-            sphere_marker.header = header
-            sphere_marker.ns = "leg_positions"
-            sphere_marker.id = marker_id
-            marker_id += 1
-            sphere_marker.type = Marker.SPHERE
-            sphere_marker.action = Marker.ADD
-            
-            sphere_marker.pose.position.x = center[0]
-            sphere_marker.pose.position.y = center[1]
-            sphere_marker.pose.position.z = center[2]
-            sphere_marker.pose.orientation.w = 1.0
-            
-            sphere_marker.scale.x = 0.15
-            sphere_marker.scale.y = 0.15
-            sphere_marker.scale.z = 0.15
-            
-            sphere_marker.color.r = 1.0
-            sphere_marker.color.g = 0.0
-            sphere_marker.color.b = 0.0
-            sphere_marker.color.a = 0.8
-            sphere_marker.lifetime = rospy.Duration(0.5)
-            
-            marker_array.markers.append(sphere_marker)
+        # First, delete all previous markers
+        delete_marker = Marker()
+        delete_marker.header = header
+        delete_marker.action = Marker.DELETEALL
+        marker_array.markers.append(delete_marker)
+        
+        marker_id = 0
         
         # Visualize walls
         for i, wall in enumerate(walls):
@@ -413,6 +377,60 @@ class LivoxObjectDetector:
             truck_text.lifetime = rospy.Duration(0.5)
             
             marker_array.markers.append(truck_text)
+        
+        # Visualize persons
+        for i, person in enumerate(persons):
+            center = person['center']
+            height = person['height']
+            width = person['width']
+            
+            # Cylinder marker for person body
+            person_marker = Marker()
+            person_marker.header = header
+            person_marker.ns = "detected_persons"
+            person_marker.id = marker_id
+            marker_id += 1
+            person_marker.type = Marker.CYLINDER
+            person_marker.action = Marker.ADD
+            
+            person_marker.pose.position.x = center[0]
+            person_marker.pose.position.y = center[1]
+            person_marker.pose.position.z = center[2]
+            person_marker.pose.orientation.w = 1.0
+            
+            person_marker.scale.x = width
+            person_marker.scale.y = width
+            person_marker.scale.z = height
+            person_marker.color.r = 1.0
+            person_marker.color.g = 0.0
+            person_marker.color.b = 0.0
+            person_marker.color.a = 0.7
+            person_marker.lifetime = rospy.Duration(0.5)
+            
+            marker_array.markers.append(person_marker)
+            
+            # Text label for person
+            person_text = Marker()
+            person_text.header = header
+            person_text.ns = "detected_persons_text"
+            person_text.id = marker_id
+            marker_id += 1
+            person_text.type = Marker.TEXT_VIEW_FACING
+            person_text.action = Marker.ADD
+            
+            person_text.pose.position.x = center[0]
+            person_text.pose.position.y = center[1]
+            person_text.pose.position.z = center[2] + height/2 + 0.3
+            
+            person_text.text = f"PERSON #{i+1}\nH:{height:.2f}m W:{width:.2f}m\n{person['points']} pts"
+            person_text.scale.z = 0.25
+            person_text.color.r = 1.0
+            person_text.color.g = 1.0
+            person_text.color.b = 1.0
+            person_text.color.a = 1.0
+            person_text.lifetime = rospy.Duration(0.5)
+            
+            marker_array.markers.append(person_text)
 
         self.marker_pub.publish(marker_array)
     

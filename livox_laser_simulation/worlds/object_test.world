@@ -12,7 +12,7 @@
     <include>
       <uri>model://simple_wall</uri>
       <name>front_wall</name>
-      <pose>5 0 1.25  0 0 0</pose>
+      <pose>10 0 1.25  0 0 0</pose>
     </include>
     
     <!-- Truck at back (negative X direction) -->
@@ -27,6 +27,12 @@
       <uri>model://tray</uri>
       <name>tray_model</name>
       <pose>0 -4 0  0 0 0</pose>
+    </include>
+    
+    <!-- Sliding person (controllable via /person_vel topic) -->
+    <include>
+      <uri>model://walking_person</uri>
+      <pose>5 0 0 0 0 0</pose>
     </include>
     
   </world>

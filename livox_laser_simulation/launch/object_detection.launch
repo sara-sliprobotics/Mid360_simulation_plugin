@@ -36,6 +36,11 @@
 		<param name="min_points" value="50" />
 		<param name="dbscan_eps" value="0.3" />
 		<param name="dbscan_min_samples" value="10" />
+		<!-- Person detection parameters -->
+		<param name="person_min_height" value="1.30" />
+		<param name="person_max_width" value="0.80" />
+		<param name="person_min_points" value="30" />
+		<param name="person_eps" value="0.35" />
 	</node>
 
 </launch>

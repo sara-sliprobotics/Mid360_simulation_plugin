@@ -1,0 +1,49 @@
+<?xml version='1.0'?>
+<sdf version='1.6'>
+  <model name='sliding_person'>
+    <pose>0 0 0 0 0 0</pose>
+    <static>false</static>
+    
+    <link name='body'>
+      <inertial>
+        <mass>60.0</mass>
+        <inertia>
+          <ixx>1.0</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>1.0</iyy>
+          <iyz>0</iyz>
+          <izz>1.0</izz>
+        </inertia>
+      </inertial>
+
+      <collision name='collision'>
+        <pose>0 0 0.9 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.25</radius>
+            <length>1.8</length>
+          </cylinder>
+        </geometry>
+      </collision>
+
+      <visual name='visual'>
+        <pose>0 0 0.9 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.25</radius>
+            <length>1.8</length>
+          </cylinder>
+        </geometry>
+      </visual>
+    </link>
+
+    <plugin name="person_controller" filename="libgazebo_ros_planar_move.so">
+      <commandTopic>person_vel</commandTopic>
+      <odometryTopic>person_odom</odometryTopic>
+      <odometryFrame>person_odom</odometryFrame>
+      <odometryRate>20.0</odometryRate>
+      <robotBaseFrame>body</robotBaseFrame>
+    </plugin>
+  </model>
+</sdf>
