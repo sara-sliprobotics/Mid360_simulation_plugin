@@ -18,6 +18,7 @@ if script_dir not in sys.path:
 
 from leg_detector import LegDetector
 from wall_detector import WallDetector
+from truck_detector import TruckDetector
 
 
 class LivoxObjectDetector:
@@ -40,6 +41,11 @@ class LivoxObjectDetector:
         wall_vertical_threshold = rospy.get_param('~wall_vertical_threshold', 0.2)
         wall_min_width = rospy.get_param('~wall_min_width', 2.0)
         
+        # Parameters for truck detection
+        truck_width = rospy.get_param('~truck_width', 2.6)
+        truck_width_tolerance = rospy.get_param('~truck_width_tolerance', 0.3)
+        truck_min_wall_length = rospy.get_param('~truck_min_wall_length', 3.0)
+
         # Initialize detectors
         self.leg_detector = LegDetector(
             height_min=leg_height_min,
@@ -58,6 +64,12 @@ class LivoxObjectDetector:
             min_wall_width=wall_min_width
         )
         
+        self.truck_detector = TruckDetector(
+            truck_width=truck_width,
+            width_tolerance=truck_width_tolerance,
+            min_wall_length=truck_min_wall_length
+        )
+
         # Subscriber
         self.pc_sub = rospy.Subscriber('/livox/lidar', PointCloud2, self.pointcloud_callback)
         
@@ -65,9 +77,10 @@ class LivoxObjectDetector:
         self.marker_pub = rospy.Publisher('/livox/detected_objects', MarkerArray, queue_size=10)
         self.detection_pub = rospy.Publisher('/livox/detections', String, queue_size=10)
         
-        rospy.loginfo("Livox Object Detector initialized with Leg and Wall Detection")
+        rospy.loginfo("Livox Object Detector initialized with Leg, Wall, and Truck Detection")
         rospy.loginfo(f"Leg height: {leg_height_min}-{leg_height_max}m, width: {leg_width_min}-{leg_width_max}m")
         rospy.loginfo(f"Wall detection: voxel={wall_voxel_size}m, min_points={wall_min_points}")
+        rospy.loginfo(f"Truck detection: width={truck_width}m ± {truck_width_tolerance}m")
     
     def pointcloud_callback(self, msg):
         """Process incoming point cloud data"""
@@ -81,17 +94,20 @@ class LivoxObjectDetector:
             
             # Detect legs using leg detector
             human_locations = self.leg_detector.detect(points)
-            
+
             # Detect walls using wall detector
             walls = self.wall_detector.detect(points)
             
+            # Detect trucks from wall pairs
+            trucks = self.truck_detector.detect(walls)
+
             # Publish detection results as structured data
-            self.publish_detections(human_locations, walls, msg.header)
-            
-            # Visualize detected humans and walls
-            self.visualize_detections(human_locations, walls, msg.header)
-            
-            rospy.loginfo_throttle(1.0, f"Detected {len(human_locations)} human(s) and {len(walls)} wall(s)")
+            self.publish_detections(human_locations, walls, trucks, msg.header)
+
+            # Visualize detected humans, walls, and trucks
+            self.visualize_detections(human_locations, walls, trucks, msg.header)
+
+            rospy.loginfo_throttle(1.0, f"Detected {len(human_locations)} human(s), {len(walls)} wall(s), and {len(trucks)} truck(s)")
             
         except Exception as e:
             rospy.logerr(f"Error processing point cloud: {e}")
@@ -105,13 +121,14 @@ class LivoxObjectDetector:
         
         return np.array(points_list)
     
-    def publish_detections(self, human_locations, walls, header):
+    def publish_detections(self, human_locations, walls, trucks, header):
         """Publish structured detection results as JSON"""
         detections = {
             'timestamp': header.stamp.to_sec(),
             'frame_id': header.frame_id,
             'humans': [],
-            'walls': []
+            'walls': [],
+            'trucks': []
         }
         
         # Add human detections
@@ -155,12 +172,31 @@ class LivoxObjectDetector:
                 'num_points': wall['num_points']
             })
         
+        # Add truck detections
+        for i, truck in enumerate(trucks):
+            detections['trucks'].append({
+                'id': i,
+                'type': 'truck',
+                'center': {
+                    'x': float(truck['center'][0]),
+                    'y': float(truck['center'][1]),
+                    'z': float(truck['center'][2])
+                },
+                'width': float(truck['width']),
+                'orientation': {
+                    'x': float(truck['orientation'][0]),
+                    'y': float(truck['orientation'][1]),
+                    'z': float(truck['orientation'][2])
+                },
+                'wall_indices': truck['wall_pair']
+            })
+
         # Publish as JSON string
         msg = String()
         msg.data = json.dumps(detections, indent=2)
         self.detection_pub.publish(msg)
     
-    def visualize_detections(self, human_locations, walls, header):
+    def visualize_detections(self, human_locations, walls, trucks, header):
         """Publish visualization markers for detected humans and walls"""
         marker_array = MarkerArray()
         marker_id = 0
@@ -308,6 +344,76 @@ class LivoxObjectDetector:
             
             marker_array.markers.append(wall_text)
         
+        # Visualize trucks
+        for i, truck in enumerate(trucks):
+            center = truck['center']
+            width = truck['width']
+            length = truck['length']
+            direction = truck['direction']
+            
+            # Calculate yaw angle from wall direction
+            yaw = np.arctan2(direction[1], direction[0])
+            
+            # Convert to quaternion
+            qz = np.sin(yaw / 2.0)
+            qw = np.cos(yaw / 2.0)
+            
+            # Bounding box for truck
+            truck_marker = Marker()
+            truck_marker.header = header
+            truck_marker.ns = "trucks"
+            truck_marker.id = marker_id
+            marker_id += 1
+            truck_marker.type = Marker.CUBE
+            truck_marker.action = Marker.ADD
+            
+            truck_marker.pose.position.x = center[0]
+            truck_marker.pose.position.y = center[1]
+            truck_marker.pose.position.z = center[2]
+            
+            # Set orientation from wall direction
+            truck_marker.pose.orientation.x = 0.0
+            truck_marker.pose.orientation.y = 0.0
+            truck_marker.pose.orientation.z = qz
+            truck_marker.pose.orientation.w = qw
+            
+            # Truck dimensions: length along wall, width between walls
+            truck_marker.scale.x = length  # Along wall direction
+            truck_marker.scale.y = width   # Between parallel walls
+            truck_marker.scale.z = 2.5     # Height
+            
+            # Color (blue for trucks)
+            truck_marker.color.r = 0.0
+            truck_marker.color.g = 0.5
+            truck_marker.color.b = 1.0
+            truck_marker.color.a = 0.4
+            truck_marker.lifetime = rospy.Duration(0.5)
+            
+            marker_array.markers.append(truck_marker)
+            
+            # Truck text label
+            truck_text = Marker()
+            truck_text.header = header
+            truck_text.ns = "truck_labels"
+            truck_text.id = marker_id
+            marker_id += 1
+            truck_text.type = Marker.TEXT_VIEW_FACING
+            truck_text.action = Marker.ADD
+            
+            truck_text.pose.position.x = center[0]
+            truck_text.pose.position.y = center[1]
+            truck_text.pose.position.z = center[2] + 1.5
+            
+            truck_text.text = f"TRUCK #{i+1}\nW:{width:.2f}m L:{length:.2f}m"
+            truck_text.scale.z = 0.3
+            truck_text.color.r = 1.0
+            truck_text.color.g = 1.0
+            truck_text.color.b = 0.0
+            truck_text.color.a = 1.0
+            truck_text.lifetime = rospy.Duration(0.5)
+            
+            marker_array.markers.append(truck_text)
+
         self.marker_pub.publish(marker_array)
     
     def run(self):
