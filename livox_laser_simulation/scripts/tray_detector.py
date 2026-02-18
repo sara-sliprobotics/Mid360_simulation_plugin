@@ -2,6 +2,48 @@ import numpy as np
 import open3d as o3d
 import math
 
+
+# This is strategy prioritize the Leg Pattern first to eliminate 90% of false positives (walls, random boxes) before you even look for the edge.
+
+#    The Strategy: "Leg-First" Detection
+
+#     Find "Leg Candidates": Slice low (0.05−0.15m), flatten, cluster, and filter for Small Objects Only (<20cm).
+
+#     Pattern Match (The "Fit"):
+
+#         If >2 Legs: Do they form a rectangle of size 2.47m×0.93m (Long Side) or 2.47m×0.83m (Short Side)?
+
+#         If 2 Legs: Are they exactly 0.93m (Long Side spacing) or 0.83m (Short Side spacing) apart?
+
+#     Edge Verification (The "Proof"):
+
+#         Look Above the confirmed legs (0.30−0.45m).
+
+#         Is there a Line connecting them?
+
+#         Yes: → CONFIRMED TRAY.
+
+#     To elimate false alarms, we use Convex Corner (a tray sticking out) and a Concave Corner (the corner of a room).
+
+#     Tray Corner: The corner "points" at the robot. (Robot is Outside).
+
+#     Room Corner: The corner "points" away from the robot. (Robot is Inside).
+
+# Here is the logic to add to your detector.
+# The Logic: "The Arrow Test"
+
+#     Identify the Corner: If you have 3 legs, one is the "Middle" (Corner) leg, and the other two are the "Ends".
+
+#     Create Edge Vectors: Calculate vectors from the Corner to the Ends (V1​ and V2​).
+
+#     Calculate "Corner Direction": The corner points in the direction of −(V1​+V2​).
+
+#     Check Robot: Is the robot standing in that direction?
+
+#         Dot Product > 0: Corner faces Robot → VALID TRAY.
+
+#         Dot Product < 0: Corner faces away → WALL (Ignore).
+
 class LegFirstTrayDetector:
     # === 1. SLICING ZONES ===
     LEG_Z_MIN = 0.05
