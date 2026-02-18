@@ -13,29 +13,32 @@ class LegFirstTrayDetector:
     MAX_LEG_SIZE = 0.25 # Reject anything bigger than 25cm
     MIN_LEG_SIZE = 0.02 # Reject noise < 2cm
     
-    # Spacing - Updated based on actual tray STL model dimensions
-    # The tray model is 5.182m x 2.473m, legs appear to be ~1.5m apart
-    SPACING_LONG  = 2.473  # Meters (short side of tray)
-    SPACING_SHORT = 1.5    # Meters (observed leg spacing)
-    SPACING_TOL   = 0.20   # Tolerance (+/- 20cm) - increased for larger tray
+    # Leg spacing from STL analysis
+    SPACING_SHORT = 1.558  # Meters - short side (Y-direction, 1.558m between legs)
+    SPACING_LONG  = 4.343  # Meters - long side (X-direction, 4.343m between legs)
+    SPACING_TOL   = 0.20   # Tolerance (+/- 20cm)
+    
+    # Full tray dimensions from STL (for center calculation)
+    TRAY_FULL_LENGTH = 5.182  # Meters (X-dimension, longest)
+    TRAY_FULL_WIDTH = 2.473   # Meters (Y-dimension)
 
     def detect(self, pcd):
         detected_trays = []
         
         # Debug: Check point cloud size
         total_points = len(np.asarray(pcd.points))
-        print(f"\n[TRAY DETECTOR] Total points in cloud: {total_points}")
+        # print(f"\n[TRAY DETECTOR] Total points in cloud: {total_points}")
         
         # --- PHASE 1: FIND LEG CANDIDATES ---
         # Returns list of {center, size, pcd}
         legs = self._find_leg_candidates(pcd)
         
-        print(f"[TRAY DETECTOR] Found {len(legs)} leg candidates")
-        for i, leg in enumerate(legs):
-            print(f"  Leg {i}: center={leg['center']}, points={len(np.asarray(leg['pcd'].points))}")
+        # print(f"[TRAY DETECTOR] Found {len(legs)} leg candidates")
+        # for i, leg in enumerate(legs):
+        #     print(f"  Leg {i}: center={leg['center']}, points={len(np.asarray(leg['pcd'].points))}")
         
         if len(legs) < 2:
-            print("  [INFO] Less than 2 legs found. Aborting.")
+            # print("  [INFO] Less than 2 legs found. Aborting.")
             return []
 
         # --- PHASE 2: FIND PAIRS & CORNERS ---
@@ -95,10 +98,31 @@ class LegFirstTrayDetector:
                         valid_2 = self._verify_edge_above(corner_leg, end_leg2, edge_cloud)
                         
                         if valid_1 and valid_2:
+                            # Calculate proper tray center from 3 legs
+                            # The corner leg and two end legs form an L-shape
+                            # Estimate the 4th leg position and calculate center
+                            c = corner_leg['center']
+                            e1 = end_leg1['center']
+                            e2 = end_leg2['center']
+                            
+                            # The 4th leg would be at the opposite corner
+                            # Vector from corner to end1 + vector from corner to end2
+                            fourth_leg = c + (e1 - c) + (e2 - c)
+                            
+                            # Tray center is average of all 4 corners
+                            tray_center = (c + e1 + e2 + fourth_leg) / 4.0
+                            tray_center[2] = self.EDGE_Z_MIN + (self.EDGE_Z_MAX - self.EDGE_Z_MIN) / 2  # Use tray top height
+                            
+                            # Calculate orientation from the two sides
+                            side1_vec = e1 - c
+                            side2_vec = e2 - c
+                            
                             detected_trays.append({
                                 "type": "TRAY_CORNER",
                                 "legs": [corner_leg, end_leg1, end_leg2],
-                                "center": corner_leg['center']
+                                "center": tray_center,
+                                "corner_leg": c,
+                                "orientation": side1_vec  # Primary direction
                             })
                             used_pair_indices.add(i)
                             used_pair_indices.add(j)
@@ -108,23 +132,86 @@ class LegFirstTrayDetector:
         # --- PHASE 4: PROCESS REMAINING PAIRS (2 LEGS) ---
         # If a pair wasn't used in a corner, check it as a standalone side
         edge_cloud = self._get_flattened_layer(pcd, self.EDGE_Z_MIN, self.EDGE_Z_MAX)
-        print(f"[TRAY DETECTOR] Edge layer ({self.EDGE_Z_MIN}m to {self.EDGE_Z_MAX}m) has {len(edge_cloud.points)} points")
+        # print(f"[TRAY DETECTOR] Edge layer ({self.EDGE_Z_MIN}m to {self.EDGE_Z_MAX}m) has {len(edge_cloud.points)} points")
 
         for i, pair in enumerate(pairs):
             if i in used_pair_indices: continue
             
-            print(f"[TRAY DETECTOR] Checking pair {i}: {pair['type']} side, dist={pair['dist']:.3f}m")
+            # print(f"[TRAY DETECTOR] Checking pair {i}: {pair['type']} side, dist={pair['dist']:.3f}m")
             
             # Verify Edge above this pair
             if self._verify_edge_above(pair['legs'][0], pair['legs'][1], edge_cloud):
+                # Calculate tray center for 2-leg detection
+                leg1_center = pair['legs'][0]['center']
+                leg2_center = pair['legs'][1]['center']
+                
+                # print(f"  [CENTER DEBUG] Leg 1: {leg1_center[:2]}")
+                # print(f"  [CENTER DEBUG] Leg 2: {leg2_center[:2]}")
+                
+                # Midpoint between the two detected legs
+                midpoint = (leg1_center + leg2_center) / 2.0
+                # print(f"  [CENTER DEBUG] Midpoint: {midpoint[:2]}")
+                
+                # Vector along the detected side
+                side_vector = leg2_center - leg1_center
+                side_length = np.linalg.norm(side_vector[:2])
+                side_dir = side_vector[:2] / side_length
+                
+                # Perpendicular direction (rotate 90 degrees)
+                perp_dir_1 = np.array([-side_dir[1], side_dir[0]])  # Counter-clockwise
+                perp_dir_2 = np.array([side_dir[1], -side_dir[0]])  # Clockwise
+                
+                # Determine which perpendicular direction faces away from robot
+                midpoint_2d = midpoint[:2]
+                to_robot = -midpoint_2d  # Vector from midpoint to robot at (0,0)
+                
+                # Choose the perpendicular direction that points away from robot
+                if np.dot(perp_dir_1, to_robot) < np.dot(perp_dir_2, to_robot):
+                    perp_dir = perp_dir_1  # This one points away from robot
+                else:
+                    perp_dir = perp_dir_2
+                
+                # print(f"  [CENTER DEBUG] Perp direction (away from robot): {perp_dir}")
+                # print(f"  [CENTER DEBUG] Dot products: perp1={np.dot(perp_dir_1, to_robot):.3f}, perp2={np.dot(perp_dir_2, to_robot):.3f}")
+                
+                # Calculate tray center by shifting from midpoint using leg spacing
+                if pair['type'] == 'SHORT':
+                    # Detected short side, shift by half of LONG leg spacing (perpendicular distance)
+                    shift_distance = self.SPACING_LONG / 2.0
+                else:  # LONG
+                    # Detected long side, shift by half of SHORT leg spacing (perpendicular distance)
+                    shift_distance = self.SPACING_SHORT / 2.0
+                
+                # print(f"  [CENTER DEBUG] Shift distance: {shift_distance:.3f}m")
+                
+                # Tray center is midpoint shifted in perpendicular direction
+                tray_center = midpoint.copy()
+                tray_center[:2] = midpoint[:2] + perp_dir * shift_distance
+                tray_center[2] = self.EDGE_Z_MIN + (self.EDGE_Z_MAX - self.EDGE_Z_MIN) / 2
+                
+                # print(f"  [CENTER DEBUG] Final tray center: {tray_center[:2]}")
+                
+                # Orientation should always be along the LONG side
+                if pair['type'] == 'SHORT':
+                    # We detected short side, so orientation is perpendicular (long side direction)
+                    long_side_vector = np.array([perp_dir[0], perp_dir[1], 0.0])
+                else:  # LONG
+                    # We detected long side, so orientation is along detected side
+                    long_side_vector = side_vector
+                
+                # print(f"  [CENTER DEBUG] Orientation (LONG side): {long_side_vector[:2]}")
+                
                 detected_trays.append({
                     "type": f"TRAY_SIDE_{pair['type']}",
                     "legs": pair['legs'],
-                    "center": (pair['legs'][0]['center'] + pair['legs'][1]['center'])/2
+                    "center": tray_center,
+                    "orientation": long_side_vector,
+                    "side_length": pair['dist']
                 })
-                print(f"  ✅ Confirmed 2-Leg Tray Side ({pair['type']})")
+                print(f"  ✅ Confirmed 2-Leg Tray Side ({pair['type']}) - Center: {tray_center[:2]}")
             else:
-                print(f"  ✗ Failed edge verification for {pair['type']} side")
+                pass
+                # print(f"  ✗ Failed edge verification for {pair['type']} side")
 
         return detected_trays
 
@@ -164,10 +251,10 @@ class LegFirstTrayDetector:
         Checks if edge points connect these two legs
         """
         total_edge_points = len(edge_cloud.points)
-        print(f"  [EDGE VERIFY] Total edge cloud points: {total_edge_points}")
+        # print(f"  [EDGE VERIFY] Total edge cloud points: {total_edge_points}")
         
         if total_edge_points < 5:
-            print(f"  [EDGE VERIFY] ✗ Too few edge points ({total_edge_points} < 5)")
+            # print(f"  [EDGE VERIFY] ✗ Too few edge points ({total_edge_points} < 5)")
             return False
         
         p1 = leg1['center'][:2]
@@ -176,10 +263,10 @@ class LegFirstTrayDetector:
         # Calculate line direction and length
         line_vec = p2 - p1
         line_length = np.linalg.norm(line_vec)
-        print(f"  [EDGE VERIFY] Leg distance: {line_length:.3f}m")
+        # print(f"  [EDGE VERIFY] Leg distance: {line_length:.3f}m")
         
         if line_length < 0.1:
-            print(f"  [EDGE VERIFY] ✗ Legs too close")
+            # print(f"  [EDGE VERIFY] ✗ Legs too close")
             return False
         
         line_dir = line_vec / line_length
@@ -209,8 +296,8 @@ class LegFirstTrayDetector:
         perp_dists = np.linalg.norm(perp_vecs, axis=1)
         
         # Debug: Show distribution of perpendicular distances
-        if len(perp_dists[valid_proj]) > 0:
-            print(f"  [EDGE VERIFY] Perp distances: min={perp_dists[valid_proj].min():.3f}m, max={perp_dists[valid_proj].max():.3f}m, median={np.median(perp_dists[valid_proj]):.3f}m")
+        # if len(perp_dists[valid_proj]) > 0:
+        #     print(f"  [EDGE VERIFY] Perp distances: min={perp_dists[valid_proj].min():.3f}m, max={perp_dists[valid_proj].max():.3f}m, median={np.median(perp_dists[valid_proj]):.3f}m")
         
         # Points within perpendicular distance and along the line segment
         # Increased tolerance since edge may be offset from leg centers
@@ -219,17 +306,17 @@ class LegFirstTrayDetector:
         
         num_edge_points = np.sum(valid_points)
         
-        print(f"  [EDGE VERIFY] Valid edge points: {num_edge_points}")
-        print(f"  [EDGE VERIFY] Max perp dist: {max_perp_dist}m, Tolerance: {tolerance}m")
+        # print(f"  [EDGE VERIFY] Valid edge points: {num_edge_points}")
+        # print(f"  [EDGE VERIFY] Max perp dist: {max_perp_dist}m, Tolerance: {tolerance}m")
         
         # Require at least 20 points to confirm edge
         min_required_points = 20
         success = num_edge_points >= min_required_points
         
-        if success:
-            print(f"  [EDGE VERIFY] ✓ Edge confirmed ({num_edge_points} >= {min_required_points} points)")
-        else:
-            print(f"  [EDGE VERIFY] ✗ Not enough edge points ({num_edge_points} < {min_required_points})")
+        # if success:
+        #     print(f"  [EDGE VERIFY] ✓ Edge confirmed ({num_edge_points} >= {min_required_points} points)")
+        # else:
+        #     print(f"  [EDGE VERIFY] ✗ Not enough edge points ({num_edge_points} < {min_required_points})")
         
         return success
 
@@ -240,16 +327,16 @@ class LegFirstTrayDetector:
         # 1. Slice & Flatten
         flat_pcd = self._get_flattened_layer(pcd, self.LEG_Z_MIN, self.LEG_Z_MAX)
         leg_layer_points = len(flat_pcd.points)
-        print(f"[TRAY DETECTOR] Points in leg layer ({self.LEG_Z_MIN}m to {self.LEG_Z_MAX}m): {leg_layer_points}")
+        # print(f"[TRAY DETECTOR] Points in leg layer ({self.LEG_Z_MIN}m to {self.LEG_Z_MAX}m): {leg_layer_points}")
         
         if len(flat_pcd.points) < 5: 
-            print("  [WARN] Too few points in leg layer")
+            # print("  [WARN] Too few points in leg layer")
             return []
         
         # 2. Cluster
         labels = np.array(flat_pcd.cluster_dbscan(eps=0.15, min_points=5))
         num_clusters = labels.max() + 1 if len(labels) > 0 else 0
-        print(f"[TRAY DETECTOR] Found {num_clusters} clusters in leg layer")
+        # print(f"[TRAY DETECTOR] Found {num_clusters} clusters in leg layer")
         
         candidates = []
         if len(labels) == 0: return candidates
@@ -268,7 +355,7 @@ class LegFirstTrayDetector:
                 length = max(extent[0], extent[1])
                 center = aabb.get_center()
                 
-                print(f"  Cluster {i}: center={center[:2]}, length={length:.3f}m, points={len(cluster_indices)}")
+                # print(f"  Cluster {i}: center={center[:2]}, length={length:.3f}m, points={len(cluster_indices)}")
                 
                 # STRICT SIZE FILTER
                 if self.MIN_LEG_SIZE < length < self.MAX_LEG_SIZE:
@@ -276,12 +363,14 @@ class LegFirstTrayDetector:
                         "center": center,
                         "pcd": cluster
                     })
-                    print(f"    ✓ Accepted as leg candidate")
+                    # print(f"    ✓ Accepted as leg candidate")
                 else:
-                    print(f"    ✗ Rejected (size out of range: {self.MIN_LEG_SIZE} < {length:.3f} < {self.MAX_LEG_SIZE})")
+                    pass
+                    # print(f"    ✗ Rejected (size out of range: {self.MIN_LEG_SIZE} < {length:.3f} < {self.MAX_LEG_SIZE})")
             except RuntimeError as e:
                 # Skip clusters that cause Qhull errors
-                print(f"  [WARN] Skipping cluster {i} due to geometry error: {e}")
+                # print(f"  [WARN] Skipping cluster {i} due to geometry error: {e}")
+                pass
                 continue
                 
         return candidates

@@ -482,21 +482,31 @@ class LivoxObjectDetector:
             tray_marker.pose.position.x = center[0]
             tray_marker.pose.position.y = center[1]
             tray_marker.pose.position.z = 0.38  # Tray deck height
-            tray_marker.pose.orientation.w = 1.0
             
-            # Approximate tray dimensions
-            if 'CORNER' in tray_type:
-                # Corner detection - show partial tray
-                tray_marker.scale.x = 2.5
-                tray_marker.scale.y = 2.5
+            # Calculate orientation from the tray's detected orientation vector
+            # Orientation always represents the LONG side direction
+            # scale.y (2.5m) should align with this orientation
+            if 'orientation' in tray:
+                import math
+                orientation_vec = tray['orientation']
+                
+                # Calculate yaw angle from orientation vector (LONG side direction)
+                # This will align scale.x with the LONG side direction
+                yaw = math.atan2(orientation_vec[1], orientation_vec[0])
+                
+                # Convert yaw to quaternion (rotation around Z axis)
+                tray_marker.pose.orientation.x = 0.0
+                tray_marker.pose.orientation.y = 0.0
+                tray_marker.pose.orientation.z = math.sin(yaw / 2.0)
+                tray_marker.pose.orientation.w = math.cos(yaw / 2.0)
             else:
-                # Side detection - show one dimension
-                if 'LONG' in tray_type:
-                    tray_marker.scale.x = 0.935
-                    tray_marker.scale.y = 2.0
-                else:  # SHORT side
-                    tray_marker.scale.x = 0.838
-                    tray_marker.scale.y = 2.0
+                tray_marker.pose.orientation.w = 1.0
+            
+            # Use tray dimensions from STL measurements
+            # TRAY_FULL_LENGTH = 5.182m, TRAY_FULL_WIDTH = 2.473m
+            from tray_detector import LegFirstTrayDetector
+            tray_marker.scale.x = LegFirstTrayDetector.TRAY_FULL_LENGTH
+            tray_marker.scale.y = LegFirstTrayDetector.TRAY_FULL_WIDTH
             
             tray_marker.scale.z = 0.05  # Thin platform
             
