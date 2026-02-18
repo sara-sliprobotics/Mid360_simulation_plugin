@@ -19,6 +19,7 @@ if script_dir not in sys.path:
 from wall_detector import WallDetector
 from truck_detector import TruckDetector
 from person_detector import PersonDetector
+from tray_detector import LegFirstTrayDetector
 
 
 class LivoxObjectDetector:
@@ -45,6 +46,9 @@ class LivoxObjectDetector:
         person_max_width = rospy.get_param('~person_max_width', 0.80)
         person_min_points = rospy.get_param('~person_min_points', 30)  # Lowered from 50
         person_eps = rospy.get_param('~person_eps', 0.35)  # Increased from 0.25
+        person_require_motion = rospy.get_param('~person_require_motion', True)
+        person_motion_threshold = rospy.get_param('~person_motion_threshold', 0.1)
+        person_stationary_timeout = rospy.get_param('~person_stationary_timeout', 2.0)
 
         # Initialize detectors
         self.wall_detector = WallDetector(
@@ -65,8 +69,13 @@ class LivoxObjectDetector:
             min_human_height=person_min_height,
             max_human_width=person_max_width,
             min_points=person_min_points,
-            eps=person_eps
+            eps=person_eps,
+            require_motion=person_require_motion,
+            motion_threshold=person_motion_threshold,
+            stationary_timeout=person_stationary_timeout
         )
+        
+        self.tray_detector = LegFirstTrayDetector()
 
         # Subscriber - use queue_size=1 to only process latest, drop old messages
         # Large buff_size to handle large point cloud messages
@@ -77,10 +86,13 @@ class LivoxObjectDetector:
         self.marker_pub = rospy.Publisher('/livox/detected_objects', MarkerArray, queue_size=10)
         self.detection_pub = rospy.Publisher('/livox/detections', String, queue_size=10)
         
-        rospy.loginfo("Livox Object Detector initialized with Wall, Truck, and Person Detection")
+        rospy.loginfo("Livox Object Detector initialized with Wall, Truck, Person, and Tray Detection")
         rospy.loginfo(f"Wall detection: voxel={wall_voxel_size}m, min_points={wall_min_points}")
         rospy.loginfo(f"Truck detection: width={truck_width}m ± {truck_width_tolerance}m")
-        rospy.loginfo(f"Person detection: height>={person_min_height}m, width<={person_max_width}m")
+        rospy.loginfo(f"Person detection: height>={person_min_height}m, width<={person_max_width}m, motion_required={person_require_motion}")
+        if person_require_motion:
+            rospy.loginfo(f"  Motion filter: threshold={person_motion_threshold}m, timeout={person_stationary_timeout}s")
+        rospy.loginfo("Tray detection: leg-based detection enabled")
     
     def pointcloud_callback(self, msg):
         """Process incoming point cloud data"""
@@ -116,21 +128,26 @@ class LivoxObjectDetector:
             person_start = time.time()
             persons = self.person_detector.detect(self.numpy_to_open3d(points))
             person_time = time.time() - person_start
+            
+            # Detect trays using tray detector
+            tray_start = time.time()
+            trays = self.tray_detector.detect(self.numpy_to_open3d(points))
+            tray_time = time.time() - tray_start
 
             # Publish detection results as structured data
             publish_start = time.time()
-            self.publish_detections(walls, trucks, persons, msg.header)
+            self.publish_detections(walls, trucks, persons, trays, msg.header)
             publish_time = time.time() - publish_start
 
-            # Visualize detected walls, trucks, and persons
+            # Visualize detected walls, trucks, persons, and trays
             viz_start = time.time()
-            self.visualize_detections(walls, trucks, persons, msg.header)
+            self.visualize_detections(walls, trucks, persons, trays, msg.header)
             viz_time = time.time() - viz_start
             
             total_time = time.time() - callback_start
 
-            rospy.loginfo_throttle(1.0, f"Processing times - Convert: {convert_time:.3f}s, Wall: {wall_time:.3f}s, Truck: {truck_time:.3f}s, Person: {person_time:.3f}s, Publish: {publish_time:.3f}s, Viz: {viz_time:.3f}s, TOTAL: {total_time:.3f}s")
-            rospy.loginfo_throttle(1.0, f"Detected {len(persons)} person(s), {len(walls)} wall(s), {len(trucks)} truck(s)")
+            rospy.loginfo_throttle(1.0, f"Processing times - Convert: {convert_time:.3f}s, Wall: {wall_time:.3f}s, Truck: {truck_time:.3f}s, Person: {person_time:.3f}s, Tray: {tray_time:.3f}s, Publish: {publish_time:.3f}s, Viz: {viz_time:.3f}s, TOTAL: {total_time:.3f}s")
+            rospy.loginfo_throttle(1.0, f"Detected {len(persons)} person(s), {len(walls)} wall(s), {len(trucks)} truck(s), {len(trays)} tray(s)")
             
         except Exception as e:
             import traceback
@@ -153,7 +170,7 @@ class LivoxObjectDetector:
         pcd.points = o3d.utility.Vector3dVector(points)
         return pcd
     
-    def publish_detections(self, walls, trucks, persons, header):
+    def publish_detections(self, walls, trucks, persons, trays, header):
         """Publish structured detection results as JSON"""
         now = rospy.Time.now()
         detections = {
@@ -162,7 +179,8 @@ class LivoxObjectDetector:
             'frame_id': header.frame_id,
             'walls': [],
             'trucks': [],
-            'persons': []
+            'persons': [],
+            'trays': []
         }
         
         # Add wall detections
@@ -227,14 +245,28 @@ class LivoxObjectDetector:
                 'width': person['width'],
                 'num_points': person['points']
             })
+        
+        # Add tray detections
+        for i, tray in enumerate(trays):
+            detections['trays'].append({
+                'id': i,
+                'type': tray.get('type', 'TRAY'),
+                'center': {
+                    'x': float(tray['center'][0]),
+                    'y': float(tray['center'][1]),
+                    'z': float(tray['center'][2])
+                },
+                'num_legs': len(tray.get('legs', [])),
+                'detection_type': tray.get('type', 'UNKNOWN')
+            })
 
         # Publish as JSON string
         msg = String()
         msg.data = json.dumps(detections, indent=2)
         self.detection_pub.publish(msg)
     
-    def visualize_detections(self, walls, trucks, persons, header):
-        """Publish visualization markers for detected walls, trucks, and persons"""
+    def visualize_detections(self, walls, trucks, persons, trays, header):
+        """Publish visualization markers for detected walls, trucks, persons, and trays"""
         marker_array = MarkerArray()
         
         # First, delete all previous markers
@@ -431,6 +463,102 @@ class LivoxObjectDetector:
             person_text.lifetime = rospy.Duration(0.5)
             
             marker_array.markers.append(person_text)
+        
+        # Visualize trays
+        for i, tray in enumerate(trays):
+            center = tray['center']
+            tray_type = tray.get('type', 'UNKNOWN')
+            num_legs = len(tray.get('legs', []))
+            
+            # Tray platform marker (cube for the tray deck)
+            tray_marker = Marker()
+            tray_marker.header = header
+            tray_marker.ns = "detected_trays"
+            tray_marker.id = marker_id
+            marker_id += 1
+            tray_marker.type = Marker.CUBE
+            tray_marker.action = Marker.ADD
+            
+            tray_marker.pose.position.x = center[0]
+            tray_marker.pose.position.y = center[1]
+            tray_marker.pose.position.z = 0.38  # Tray deck height
+            tray_marker.pose.orientation.w = 1.0
+            
+            # Approximate tray dimensions
+            if 'CORNER' in tray_type:
+                # Corner detection - show partial tray
+                tray_marker.scale.x = 2.5
+                tray_marker.scale.y = 2.5
+            else:
+                # Side detection - show one dimension
+                if 'LONG' in tray_type:
+                    tray_marker.scale.x = 0.935
+                    tray_marker.scale.y = 2.0
+                else:  # SHORT side
+                    tray_marker.scale.x = 0.838
+                    tray_marker.scale.y = 2.0
+            
+            tray_marker.scale.z = 0.05  # Thin platform
+            
+            # Color (green for trays)
+            tray_marker.color.r = 0.0
+            tray_marker.color.g = 1.0
+            tray_marker.color.b = 0.0
+            tray_marker.color.a = 0.5
+            tray_marker.lifetime = rospy.Duration(0.5)
+            
+            marker_array.markers.append(tray_marker)
+            
+            # Visualize individual legs
+            for leg_idx, leg in enumerate(tray.get('legs', [])):
+                leg_marker = Marker()
+                leg_marker.header = header
+                leg_marker.ns = "tray_legs"
+                leg_marker.id = marker_id
+                marker_id += 1
+                leg_marker.type = Marker.CYLINDER
+                leg_marker.action = Marker.ADD
+                
+                leg_marker.pose.position.x = leg['center'][0]
+                leg_marker.pose.position.y = leg['center'][1]
+                leg_marker.pose.position.z = 0.19  # Mid-height of leg (~38cm/2)
+                leg_marker.pose.orientation.w = 1.0
+                
+                leg_marker.scale.x = 0.10  # Leg diameter ~10cm
+                leg_marker.scale.y = 0.10
+                leg_marker.scale.z = 0.38  # Leg height ~38cm
+                
+                # Color (darker green for legs)
+                leg_marker.color.r = 0.0
+                leg_marker.color.g = 0.6
+                leg_marker.color.b = 0.0
+                leg_marker.color.a = 0.7
+                leg_marker.lifetime = rospy.Duration(0.5)
+                
+                marker_array.markers.append(leg_marker)
+            
+            # Tray text label
+            tray_text = Marker()
+            tray_text.header = header
+            tray_text.ns = "tray_labels"
+            tray_text.id = marker_id
+            marker_id += 1
+            tray_text.type = Marker.TEXT_VIEW_FACING
+            tray_text.action = Marker.ADD
+            
+            tray_text.pose.position.x = center[0]
+            tray_text.pose.position.y = center[1]
+            tray_text.pose.position.z = 0.6  # Above tray
+            
+            tray_text.text = f"TRAY #{i+1}\n{tray_type}\n{num_legs} legs"
+            tray_text.scale.z = 0.25
+            tray_text.color.r = 0.0
+            tray_text.color.g = 1.0
+            tray_text.color.b = 0.0
+            tray_text.color.a = 1.0
+            tray_text.lifetime = rospy.Duration(0.5)
+            
+            marker_array.markers.append(tray_text)
 
         self.marker_pub.publish(marker_array)
     
