@@ -1,6 +1,7 @@
 import numpy as np
-import open3d as o3d
 import math
+from leg_detector import LegDetector
+import tray_config
 
 
 # This is strategy prioritize the Leg Pattern first to eliminate 90% of false positives (walls, random boxes) before you even look for the edge.
@@ -45,35 +46,27 @@ import math
 #         Dot Product < 0: Corner faces away → WALL (Ignore).
 
 class LegFirstTrayDetector:
-    # === 1. SLICING ZONES ===
-    LEG_Z_MIN = 0.05
-    LEG_Z_MAX = 0.15
-    EDGE_Z_MIN = 0.28   # Start slightly below tray top
-    EDGE_Z_MAX = 0.45   # End slightly above tray top
-    
-    # === 2. GEOMETRY CONSTRAINTS ===
-    MAX_LEG_SIZE = 0.25 # Reject anything bigger than 25cm
-    MIN_LEG_SIZE = 0.02 # Reject noise < 2cm
-    
-    # Leg spacing from STL analysis
-    SPACING_SHORT = 1.558  # Meters - short side (Y-direction, 1.558m between legs)
-    SPACING_LONG  = 4.343  # Meters - long side (X-direction, 4.343m between legs)
-    SPACING_TOL   = 0.20   # Tolerance (+/- 20cm)
-    
-    # Full tray dimensions from STL (for center calculation)
-    TRAY_FULL_LENGTH = 5.182  # Meters (X-dimension, longest)
-    TRAY_FULL_WIDTH = 2.473   # Meters (Y-dimension)
+    EDGE_Z_MIN = tray_config.EDGE_Z_MIN
+    EDGE_Z_MAX = tray_config.EDGE_Z_MAX
+    SPACING_SHORT = tray_config.SPACING_SHORT
+    SPACING_LONG = tray_config.SPACING_LONG
+    SPACING_TOL = tray_config.SPACING_TOL
+    TRAY_FULL_LENGTH = tray_config.TRAY_FULL_LENGTH
+    TRAY_FULL_WIDTH = tray_config.TRAY_FULL_WIDTH
+
+    def __init__(self):
+        self.leg_detector = LegDetector()
 
     def detect(self, pcd):
         detected_trays = []
-        
+
         # Debug: Check point cloud size
         total_points = len(np.asarray(pcd.points))
         # print(f"\n[TRAY DETECTOR] Total points in cloud: {total_points}")
-        
+
         # --- PHASE 1: FIND LEG CANDIDATES ---
         # Returns list of {center, size, pcd}
-        legs = self._find_leg_candidates(pcd)
+        legs = self.leg_detector.find_candidates(pcd)
         
         # print(f"[TRAY DETECTOR] Found {len(legs)} leg candidates")
         # for i, leg in enumerate(legs):
@@ -83,101 +76,78 @@ class LegFirstTrayDetector:
             # print("  [INFO] Less than 2 legs found. Aborting.")
             return []
 
-        # --- PHASE 2: FIND PAIRS & CORNERS ---
-        # We build a graph of connected legs
-        pairs = []
-        
-        # O(N^2) search for valid pairs (N is small, usually < 10)
-        for i in range(len(legs)):
-            for j in range(i + 1, len(legs)):
-                leg1 = legs[i]
-                leg2 = legs[j]
-                
-                dist = np.linalg.norm(leg1['center'][:2] - leg2['center'][:2])
-                
-                # Identify Type
-                is_long = abs(dist - self.SPACING_LONG) < self.SPACING_TOL
-                is_short = abs(dist - self.SPACING_SHORT) < self.SPACING_TOL
-                
-                if is_long or is_short:
-                    pairs.append({
-                        "type": "LONG" if is_long else "SHORT",
-                        "legs": [leg1, leg2],
-                        "indices": {i, j}, # Set for easy matching
-                        "dist": dist
-                    })
+        # --- PHASE 2: FIND PAIRS ---
+        pairs = self.leg_detector.find_pairs(legs)
 
         # --- PHASE 3: PROCESS CORNERS (3 LEGS) ---
         # If two pairs share a leg, they form a corner.
-        # We prioritize Corners over single Pairs because they are higher confidence.
-        used_pair_indices = set()
-        
+        # Track used leg indices so each leg can only belong to one detected tray,
+        # preventing duplicate detections when all 4 legs are visible.
+        used_leg_indices = set()
+
         for i, pair1 in enumerate(pairs):
             for j, pair2 in enumerate(pairs):
-                if i >= j: continue # Avoid duplicates
-                
+                if i >= j: continue
+
                 # Check intersection (do they share exactly 1 leg?)
                 shared = pair1['indices'].intersection(pair2['indices'])
-                
+
                 if len(shared) == 1:
+                    all_leg_indices = pair1['indices'] | pair2['indices']
+
+                    # Skip if any of the 3 legs already belongs to a detected tray
+                    if all_leg_indices & used_leg_indices:
+                        continue
+
                     # FOUND POTENTIAL CORNER!
                     shared_idx = list(shared)[0]
                     corner_leg = legs[shared_idx]
-                    
+
                     # Identify the "End Legs"
                     idx1 = list(pair1['indices'] - shared)[0]
                     idx2 = list(pair2['indices'] - shared)[0]
                     end_leg1 = legs[idx1]
                     end_leg2 = legs[idx2]
-                    
+
                     # *** CRITICAL CHECK: IS IT FACING THE ROBOT? ***
                     if self._check_corner_facing(corner_leg, end_leg1, end_leg2):
-                        print("  ✅ Valid Convex Corner (Facing Robot)")
-                        
+                        # print("  ✅ Valid Convex Corner (Facing Robot)")
+
                         # Verify Edge above BOTH sides
-                        edge_cloud = self._get_flattened_layer(pcd, self.EDGE_Z_MIN, self.EDGE_Z_MAX)
+                        edge_cloud = self.leg_detector.get_flattened_layer(pcd, self.EDGE_Z_MIN, self.EDGE_Z_MAX)
                         valid_1 = self._verify_edge_above(corner_leg, end_leg1, edge_cloud)
                         valid_2 = self._verify_edge_above(corner_leg, end_leg2, edge_cloud)
-                        
+
                         if valid_1 and valid_2:
-                            # Calculate proper tray center from 3 legs
-                            # The corner leg and two end legs form an L-shape
-                            # Estimate the 4th leg position and calculate center
                             c = corner_leg['center']
                             e1 = end_leg1['center']
                             e2 = end_leg2['center']
-                            
-                            # The 4th leg would be at the opposite corner
-                            # Vector from corner to end1 + vector from corner to end2
+
+                            # Estimate the 4th leg and compute tray center
                             fourth_leg = c + (e1 - c) + (e2 - c)
-                            
-                            # Tray center is average of all 4 corners
                             tray_center = (c + e1 + e2 + fourth_leg) / 4.0
-                            tray_center[2] = self.EDGE_Z_MIN + (self.EDGE_Z_MAX - self.EDGE_Z_MIN) / 2  # Use tray top height
-                            
-                            # Calculate orientation from the two sides
+                            tray_center[2] = self.EDGE_Z_MIN + (self.EDGE_Z_MAX - self.EDGE_Z_MIN) / 2
+
                             side1_vec = e1 - c
-                            side2_vec = e2 - c
-                            
+
                             detected_trays.append({
                                 "type": "TRAY_CORNER",
                                 "legs": [corner_leg, end_leg1, end_leg2],
                                 "center": tray_center,
                                 "corner_leg": c,
-                                "orientation": side1_vec  # Primary direction
+                                "orientation": side1_vec
                             })
-                            used_pair_indices.add(i)
-                            used_pair_indices.add(j)
-                    else:
-                        print("  ❌ Ignored Concave Corner (Wall)")
+                            used_leg_indices |= all_leg_indices
+                    # else:
+                        # print("  ❌ Ignored Concave Corner (Wall)")
 
         # --- PHASE 4: PROCESS REMAINING PAIRS (2 LEGS) ---
         # If a pair wasn't used in a corner, check it as a standalone side
-        edge_cloud = self._get_flattened_layer(pcd, self.EDGE_Z_MIN, self.EDGE_Z_MAX)
+        edge_cloud = self.leg_detector.get_flattened_layer(pcd, self.EDGE_Z_MIN, self.EDGE_Z_MAX)
         # print(f"[TRAY DETECTOR] Edge layer ({self.EDGE_Z_MIN}m to {self.EDGE_Z_MAX}m) has {len(edge_cloud.points)} points")
 
         for i, pair in enumerate(pairs):
-            if i in used_pair_indices: continue
+            if pair['indices'] & used_leg_indices: continue
             
             # print(f"[TRAY DETECTOR] Checking pair {i}: {pair['type']} side, dist={pair['dist']:.3f}m")
             
@@ -250,7 +220,8 @@ class LegFirstTrayDetector:
                     "orientation": long_side_vector,
                     "side_length": pair['dist']
                 })
-                print(f"  ✅ Confirmed 2-Leg Tray Side ({pair['type']}) - Center: {tray_center[:2]}")
+                used_leg_indices |= pair['indices']
+                # print(f"  ✅ Confirmed 2-Leg Tray Side ({pair['type']}) - Center: {tray_center[:2]}")
             else:
                 pass
                 # print(f"  ✗ Failed edge verification for {pair['type']} side")
@@ -361,70 +332,3 @@ class LegFirstTrayDetector:
         #     print(f"  [EDGE VERIFY] ✗ Not enough edge points ({num_edge_points} < {min_required_points})")
         
         return success
-
-    def _find_leg_candidates(self, pcd):
-        """
-        Slice -> Flatten -> Cluster -> Size Filter
-        """
-        # 1. Slice & Flatten
-        flat_pcd = self._get_flattened_layer(pcd, self.LEG_Z_MIN, self.LEG_Z_MAX)
-        leg_layer_points = len(flat_pcd.points)
-        # print(f"[TRAY DETECTOR] Points in leg layer ({self.LEG_Z_MIN}m to {self.LEG_Z_MAX}m): {leg_layer_points}")
-        
-        if len(flat_pcd.points) < 5: 
-            # print("  [WARN] Too few points in leg layer")
-            return []
-        
-        # 2. Cluster
-        labels = np.array(flat_pcd.cluster_dbscan(eps=0.15, min_points=5))
-        num_clusters = labels.max() + 1 if len(labels) > 0 else 0
-        # print(f"[TRAY DETECTOR] Found {num_clusters} clusters in leg layer")
-        
-        candidates = []
-        if len(labels) == 0: return candidates
-        
-        # 3. Filter Size
-        for i in range(labels.max() + 1):
-            cluster_indices = np.where(labels == i)[0]
-            cluster = flat_pcd.select_by_index(cluster_indices)
-            
-            # Use axis-aligned bounding box for flattened (2D) data
-            # to avoid Qhull errors with coplanar points
-            try:
-                aabb = cluster.get_axis_aligned_bounding_box()
-                extent = aabb.get_extent()
-                # Get the largest dimension in the XY plane (Z is 0)
-                length = max(extent[0], extent[1])
-                center = aabb.get_center()
-                
-                # print(f"  Cluster {i}: center={center[:2]}, length={length:.3f}m, points={len(cluster_indices)}")
-                
-                # STRICT SIZE FILTER
-                if self.MIN_LEG_SIZE < length < self.MAX_LEG_SIZE:
-                    candidates.append({
-                        "center": center,
-                        "pcd": cluster
-                    })
-                    # print(f"    ✓ Accepted as leg candidate")
-                else:
-                    pass
-                    # print(f"    ✗ Rejected (size out of range: {self.MIN_LEG_SIZE} < {length:.3f} < {self.MAX_LEG_SIZE})")
-            except RuntimeError as e:
-                # Skip clusters that cause Qhull errors
-                # print(f"  [WARN] Skipping cluster {i} due to geometry error: {e}")
-                pass
-                continue
-                
-        return candidates
-
-    def _get_flattened_layer(self, pcd, z_min, z_max):
-        """Helper to crop and flatten Z"""
-        bbox = o3d.geometry.AxisAlignedBoundingBox(
-            min_bound=np.array([-100, -100, z_min]),
-            max_bound=np.array([ 100,  100, z_max])
-        )
-        pts = np.asarray(pcd.crop(bbox).points)
-        if len(pts) > 0: pts[:, 2] = 0
-        pcd_flat = o3d.geometry.PointCloud()
-        if len(pts) > 0: pcd_flat.points = o3d.utility.Vector3dVector(pts)
-        return pcd_flat

@@ -59,6 +59,10 @@ catkin_install_python(PROGRAMS
   scripts/truck_detector.py
   scripts/tray_detector.py
   scripts/oscillate_person.py
+  scripts/leg_detector.py
+  scripts/leg_model.py
+  scripts/frame_accumulator.py
+  scripts/tray_config.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

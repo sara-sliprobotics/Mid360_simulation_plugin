@@ -1,0 +1,38 @@
+<?xml version="1.0" ?>
+<launch>
+
+	<!-- Set Gazebo model path to include our custom models -->
+	<env name="GAZEBO_MODEL_PATH" value="$(find livox_laser_simulation)/models:$(optenv GAZEBO_MODEL_PATH)" />
+
+	<!-- Sensor model and initial position -->
+	<arg name="UAV_model" value="$(find livox_laser_simulation)/models/sensors_only/model.sdf" />
+	<arg name="x" value="0" />
+	<arg name="y" value="0" />
+	<arg name="z" value="0" />
+
+	<!-- Tray test world -->
+	<arg name="world" default="$(find livox_laser_simulation)/worlds/tray_test.world" />
+
+	<include file="$(find gazebo_ros)/launch/empty_world.launch">
+		<arg name="world_name" value="$(arg world)"/>
+		<arg name="paused" value="false"/>
+		<arg name="use_sim_time" value="true"/>
+		<arg name="gui" value="true"/>
+		<arg name="headless" value="false"/>
+		<arg name="debug" value="false"/>
+		<arg name="verbose" value="true"/>
+	</include>
+
+	<!-- RViz -->
+	<node name="rviz" pkg="rviz" type="rviz" args="-d $(find livox_laser_simulation)/rviz/test_pattern.rviz" />
+
+	<!-- Spawn the sensor model -->
+	<node name="spawn_model" pkg="gazebo_ros" type="spawn_model" respawn="false" output="screen"
+		args="-file $(arg UAV_model) -x $(arg x) -y $(arg y) -z $(arg z) -sdf -model iris_demo" />
+
+	<!-- Object detection node (tray detection enabled) -->
+	<node name="livox_object_detector" pkg="livox_laser_simulation" type="object_detection.py" output="screen">
+		<param name="min_points" value="50" />
+	</node>
+
+</launch>

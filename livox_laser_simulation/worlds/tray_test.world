@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<sdf version="1.4">
+  <world name="default">
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Tray -->
+    <include>
+      <uri>model://tray</uri>
+      <name>tray_model</name>
+      <pose>0 -4 0  0 0 0</pose>
+    </include>
+
+  </world>
+</sdf>
