@@ -31,6 +31,13 @@
 	<node name="spawn_model" pkg="gazebo_ros" type="spawn_model" respawn="false" output="screen"
 		args="-file $(arg UAV_model) -x $(arg x) -y $(arg y) -z $(arg z) -sdf -model iris_demo " />
 
+	<!-- Oscillate sensor model back and forth along X -->
+	<node name="oscillate_model" pkg="livox_laser_simulation" type="oscillate_model.py" output="screen">
+		<param name="x_min" value="-1.0" />
+		<param name="x_max" value="1.0" />
+		<param name="period" value="6.0" />
+	</node>
+
 	<!-- Object detection node -->
 	<node name="livox_object_detector" pkg="livox_laser_simulation" type="object_detection.py" output="screen">
 		<param name="min_points" value="50" />

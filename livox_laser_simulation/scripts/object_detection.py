@@ -78,14 +78,13 @@ class LivoxObjectDetector:
             stationary_timeout=person_stationary_timeout
         )
         
-        self.tray_detector = LegFirstTrayDetector()
-        
-        # Initialize FrameAccumulator for leg detection (accumulate 5 frames)
-        leg_accumulator_frames = rospy.get_param('~leg_accumulator_frames', 5)
-        self.leg_accumulator = FrameAccumulator('/livox/lidar', num_frames=leg_accumulator_frames)
-        
-        # Initialize leg detector with accumulator
-        self.leg_detector = LegDetector(accumulator=self.leg_accumulator)
+        # Initialize FrameAccumulator (accumulate frames with TF into fixed frame)
+        accumulator_frames = rospy.get_param('~accumulator_frames', 5)
+        self.accumulator = FrameAccumulator('/livox/lidar', num_frames=accumulator_frames, fixed_frame='odom')
+
+        # Initialize tray and leg detectors with the shared accumulator
+        self.tray_detector = LegFirstTrayDetector(accumulator=self.accumulator)
+        self.leg_detector = LegDetector(accumulator=self.accumulator)
 
         # Subscriber - use queue_size=1 to only process latest, drop old messages
         # Large buff_size to handle large point cloud messages
@@ -95,6 +94,7 @@ class LivoxObjectDetector:
         # Publishers
         self.marker_pub = rospy.Publisher('/livox/detected_objects', MarkerArray, queue_size=10)
         self.detection_pub = rospy.Publisher('/livox/detections', String, queue_size=10)
+        self.accumulated_cloud_pub = rospy.Publisher('/livox/accumulated_cloud', PointCloud2, queue_size=1)
         
         rospy.loginfo("Livox Object Detector initialized with Wall, Truck, Person, and Tray Detection")
         rospy.loginfo(f"Wall detection: voxel={wall_voxel_size}m, min_points={wall_min_points}")
@@ -103,7 +103,7 @@ class LivoxObjectDetector:
         if person_require_motion:
             rospy.loginfo(f"  Motion filter: threshold={person_motion_threshold}m, timeout={person_stationary_timeout}s")
         rospy.loginfo("Tray detection: leg-based detection enabled")
-        rospy.loginfo(f"Leg detection: using frame accumulator with {leg_accumulator_frames} frames")
+        rospy.loginfo(f"Frame accumulator: {accumulator_frames} frames")
     
     def pointcloud_callback(self, msg):
         """Process incoming point cloud data"""
@@ -140,23 +140,33 @@ class LivoxObjectDetector:
             persons = self.person_detector.detect(self.numpy_to_open3d(points))
             person_time = time.time() - person_start
             
-            # Detect trays using tray detector
+            # Publish accumulated cloud for debugging in RViz
+            acc_cloud = self.accumulator.get_accumulated_cloud()
+            if acc_cloud is not None and len(acc_cloud.points) > 0:
+                acc_pts = np.asarray(acc_cloud.points).astype(np.float32)
+                acc_header = Header()
+                acc_header.stamp = msg.header.stamp
+                acc_header.frame_id = 'odom'
+                acc_msg = pc2.create_cloud_xyz32(acc_header, acc_pts)
+                self.accumulated_cloud_pub.publish(acc_msg)
+
+            # Detect trays using tray detector (accumulator provides point cloud, wall removal is internal)
             tray_start = time.time()
-            trays = self.tray_detector.detect(self.numpy_to_open3d(points))
+            trays = self.tray_detector.detect(walls=walls)
             tray_time = time.time() - tray_start
             
             # Detect legs using leg detector within each detected tray's bounding box
             leg_start = time.time()
             legs = []
-            
+
             for tray in trays:
                 # Create an inflated bounding box around the detected tray
                 tray_center = tray['center']
-                
+
                 # Import tray dimensions
                 import tray_config
                 import open3d as o3d
-                
+
                 # Use the same half-size for both X and Y so the box is
                 # rotation-invariant (the tray can be at any yaw angle).
                 inflation = 0.2
@@ -173,14 +183,14 @@ class LivoxObjectDetector:
                     tray_center[1] + half_size,
                     0.5  # Above ground to capture legs
                 ])
-                
+
                 tray_box = o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
-                
+
                 # Detect legs within this tray's bounding box using accumulated frames
                 # No need to pass pcd since leg_detector has an accumulator
                 tray_legs = self.leg_detector.detect(box=tray_box)
                 legs.extend(tray_legs)
-            
+
             leg_time = time.time() - leg_start
 
             # Publish detection results as structured data
@@ -196,7 +206,7 @@ class LivoxObjectDetector:
             total_time = time.time() - callback_start
 
             rospy.loginfo_throttle(1.0, f"Processing times - Convert: {convert_time:.3f}s, Wall: {wall_time:.3f}s, Truck: {truck_time:.3f}s, Person: {person_time:.3f}s, Tray: {tray_time:.3f}s, Leg: {leg_time:.3f}s, Publish: {publish_time:.3f}s, Viz: {viz_time:.3f}s, TOTAL: {total_time:.3f}s")
-            rospy.loginfo_throttle(1.0, f"Detected {len(persons)} person(s), {len(walls)} wall(s), {len(trucks)} truck(s), {len(trays)} tray(s), {len(legs)} leg(s)")
+            rospy.loginfo_throttle(1.0, f"Detected {len(persons)} person(s), {len(walls)} wall(s), {len(trucks)} truck(s), {len(trays)} tray(s)")
             
         except Exception as e:
             import traceback
@@ -532,15 +542,21 @@ class LivoxObjectDetector:
             
             marker_array.markers.append(person_text)
         
+        # Tray and leg detections are in odom frame (accumulated cloud),
+        # so use an odom header instead of the base_link header
+        odom_header = Header()
+        odom_header.stamp = header.stamp
+        odom_header.frame_id = 'odom'
+
         # Visualize trays
         for i, tray in enumerate(trays):
             center = tray['center']
             tray_type = tray.get('type', 'UNKNOWN')
             num_legs = len(tray.get('legs', []))
-            
+
             # Tray platform marker (cube for the tray deck)
             tray_marker = Marker()
-            tray_marker.header = header
+            tray_marker.header = odom_header
             tray_marker.ns = "detected_trays"
             tray_marker.id = marker_id
             marker_id += 1
@@ -588,7 +604,7 @@ class LivoxObjectDetector:
             
             # Tray text label
             tray_text = Marker()
-            tray_text.header = header
+            tray_text.header = odom_header
             tray_text.ns = "tray_labels"
             tray_text.id = marker_id
             marker_id += 1
@@ -619,7 +635,7 @@ class LivoxObjectDetector:
             leg_markers, marker_id = create_leg_markers(
                 transform,
                 pair_type,
-                header,
+                odom_header,
                 ns=f"fitted_legs_{i}",
                 marker_id_start=marker_id
             )

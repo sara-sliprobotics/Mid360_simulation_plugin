@@ -1,7 +1,22 @@
 <?xml version='1.0'?>
 <sdf version="1.6">
   <model name="iris_demo">
-    <!-- add lidars -->
+    <!-- Base link at ground level -->
+    <link name="base_link">
+      <inertial>
+        <mass>1.0</mass>
+        <inertia>
+          <ixx>0.001</ixx>
+          <ixy>0.0</ixy>
+          <ixz>0.0</ixz>
+          <iyy>0.001</iyy>
+          <iyz>0.0</iyz>
+          <izz>0.001</izz>
+        </inertia>
+      </inertial>
+    </link>
+
+    <!-- Lidar mounted on base -->
     <link name = "lidar_link">
       <pose>0.0 0.0 0.2 0.0 0.0 0.0</pose>
       <inertial>
@@ -74,9 +89,12 @@
       </sensor>
 
     </link>
-    
-    
 
+    <!-- Fixed joint: base_link → lidar_link -->
+    <joint name="base_to_lidar" type="fixed">
+      <parent>base_link</parent>
+      <child>lidar_link</child>
+    </joint>
 
   </model>
 </sdf>

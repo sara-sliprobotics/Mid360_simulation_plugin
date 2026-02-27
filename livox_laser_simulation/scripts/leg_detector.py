@@ -10,6 +10,7 @@ class LegDetector:
     LEG_Z_MAX = tray_config.LEG_Z_MAX
     MAX_LEG_SIZE = tray_config.MAX_LEG_SIZE
     MIN_LEG_SIZE = tray_config.MIN_LEG_SIZE
+    MIN_LEG_POINTS = 15       # Reject clusters with fewer points (noise)
 
     def __init__(self, accumulator: FrameAccumulator = None):
         self.accumulator = accumulator
@@ -70,6 +71,9 @@ class LegDetector:
                     candidates.append(candidate)
             except RuntimeError:
                 continue
+
+        # Filter by minimum point count (removes noise clusters)
+        candidates = [c for c in candidates if len(c['pcd'].points) >= self.MIN_LEG_POINTS]
 
         return candidates
 
