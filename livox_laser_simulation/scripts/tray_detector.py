@@ -265,7 +265,25 @@ class LegFirstTrayDetector:
             used_leg_indices |= pair['indices']
             print(f"  ✅ Confirmed 2-Leg Tray Side ({pair['type']}) - Center: {tray_center[:2]}")
 
-        return detected_trays
+        # --- PHASE 5: DEDUPLICATE ---
+        # Merge detections whose centers are within 1.5m (same physical tray)
+        # Prefer CORNER detections (3 legs) over SIDE detections (2 legs)
+        deduped = []
+        for tray in detected_trays:
+            is_dup = False
+            for existing in deduped:
+                dist = np.linalg.norm(tray['center'][:2] - existing['center'][:2])
+                if dist < 1.5:
+                    # Keep the one with more legs (corner > side)
+                    if len(tray.get('legs', [])) > len(existing.get('legs', [])):
+                        deduped.remove(existing)
+                        deduped.append(tray)
+                    is_dup = True
+                    break
+            if not is_dup:
+                deduped.append(tray)
+
+        return deduped
 
     def _check_corner_facing(self, corner_leg, end1, end2):
         """

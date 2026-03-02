@@ -6,6 +6,9 @@
 
 	<!-- This is where we select the model file for the UAV-->
 	<arg name="UAV_model" value="$(find livox_laser_simulation)/models/sensors_only/model.sdf" />
+	<!-- Set to true for moving lidar, false for still lidar -->
+	<arg name="moving_lidar" default="true" />
+
 	<!-- This is where we set the initial position of the UAV-->
 	<arg name="x" value="0" />
   	<arg name="y" value="0" />
@@ -31,12 +34,18 @@
 	<node name="spawn_model" pkg="gazebo_ros" type="spawn_model" respawn="false" output="screen"
 		args="-file $(arg UAV_model) -x $(arg x) -y $(arg y) -z $(arg z) -sdf -model iris_demo " />
 
-	<!-- Oscillate sensor model back and forth along X -->
-	<node name="oscillate_model" pkg="livox_laser_simulation" type="oscillate_model.py" output="screen">
+	<!-- Oscillate sensor model back and forth along X (only when moving_lidar is true) -->
+	<node name="oscillate_model" pkg="livox_laser_simulation" type="oscillate_model.py" output="screen"
+		if="$(arg moving_lidar)">
 		<param name="x_min" value="-1.0" />
 		<param name="x_max" value="1.0" />
 		<param name="period" value="6.0" />
 	</node>
+
+	<!-- Static odom -> base_link TF for still lidar (identity, no motion) -->
+	<node name="static_odom_tf" pkg="tf2_ros" type="static_transform_publisher"
+		args="0 0 0 0 0 0 odom base_link"
+		unless="$(arg moving_lidar)" />
 
 	<!-- Object detection node -->
 	<node name="livox_object_detector" pkg="livox_laser_simulation" type="object_detection.py" output="screen">
