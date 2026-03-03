@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import rospy
 from leg_detector import LegDetector
 import tray_config
 
@@ -58,6 +59,23 @@ class LegFirstTrayDetector:
         self.leg_detector = LegDetector()
         self.accumulator = accumulator
 
+    def _get_robot_pos_in_fixed_frame(self):
+        """
+        Look up the robot's XY position in the accumulator's fixed frame (odom).
+        Returns np.array([x, y]) or np.array([0, 0]) if TF is unavailable.
+        """
+        if self.accumulator is None:
+            return np.array([0.0, 0.0])
+        try:
+            transform = self.accumulator._tf_buffer.lookup_transform(
+                self.accumulator._fixed_frame, 'base_link',
+                rospy.Time(0), rospy.Duration(0.1)
+            )
+            t = transform.transform.translation
+            return np.array([t.x, t.y])
+        except Exception:
+            return np.array([0.0, 0.0])
+
     def _transform_plane_to_fixed_frame(self, plane_model):
         """
         Transform a plane equation [a, b, c, d] from base_link to the
@@ -86,6 +104,9 @@ class LegFirstTrayDetector:
 
     def detect(self, pcd=None, walls=None):
         detected_trays = []
+
+        # Cache robot position once per detection cycle
+        self._robot_pos = self._get_robot_pos_in_fixed_frame()
 
         # Use accumulated cloud if available, otherwise fall back to pcd
         if self.accumulator is not None:
@@ -185,14 +206,20 @@ class LegFirstTrayDetector:
                             tray_center = (c + e1 + e2 + fourth_leg) / 4.0
                             tray_center[2] = self.EDGE_Z_MIN + (self.EDGE_Z_MAX - self.EDGE_Z_MIN) / 2
 
-                            side1_vec = e1 - c
+                            # Use the LONGER edge as orientation (that's the long side)
+                            vec1 = e1 - c
+                            vec2 = e2 - c
+                            if np.linalg.norm(vec1[:2]) > np.linalg.norm(vec2[:2]):
+                                long_side_vec = vec1
+                            else:
+                                long_side_vec = vec2
 
                             detected_trays.append({
                                 "type": "TRAY_CORNER",
                                 "legs": [corner_leg, end_leg1, end_leg2],
                                 "center": tray_center,
                                 "corner_leg": c,
-                                "orientation": side1_vec
+                                "orientation": long_side_vec
                             })
                             used_leg_indices |= all_leg_indices
                     # else:
@@ -231,7 +258,7 @@ class LegFirstTrayDetector:
 
             # Determine which perpendicular direction faces away from robot
             midpoint_2d = midpoint[:2]
-            to_robot = -midpoint_2d  # Vector from midpoint to robot at (0,0)
+            to_robot = self._robot_pos - midpoint_2d  # Vector from midpoint to robot
 
             # Choose the perpendicular direction that points away from robot
             if np.dot(perp_dir_1, to_robot) < np.dot(perp_dir_2, to_robot):
@@ -287,33 +314,33 @@ class LegFirstTrayDetector:
 
     def _check_corner_facing(self, corner_leg, end1, end2):
         """
-        Dot Product Check: Does the corner point at the robot (0,0)?
+        Dot Product Check: Does the corner point at the robot?
         """
         c = corner_leg['center'][:2]
         e1 = end1['center'][:2]
         e2 = end2['center'][:2]
-        
+
         # Vectors from Corner -> Ends
         v1 = e1 - c
         v2 = e2 - c
-        
+
         # Normalize
         v1 = v1 / (np.linalg.norm(v1) + 1e-6)
         v2 = v2 / (np.linalg.norm(v2) + 1e-6)
-        
+
         # Corner Bisector (Points OUT of the corner)
         # We reverse (v1+v2) because v1/v2 point "into" the structure
         corner_vector = -(v1 + v2)
-        
-        # Vector from Corner to Robot (Robot is at 0,0)
-        to_robot = np.array([0,0]) - c
+
+        # Vector from Corner to Robot (actual position in odom)
+        to_robot = self._robot_pos - c
         to_robot = to_robot / (np.linalg.norm(to_robot) + 1e-6)
-        
+
         # Dot Product
         # > 0: Corner faces robot (Convex) -> TRAY
         # < 0: Corner faces away (Concave) -> WALL
         score = np.dot(corner_vector, to_robot)
-        
+
         return score > 0.2 # Use 0.2 buffer to be safe
 
     def _verify_edge_above(self, leg1, leg2, edge_cloud):

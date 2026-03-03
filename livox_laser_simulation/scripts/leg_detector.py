@@ -1,5 +1,6 @@
 import numpy as np
 import open3d as o3d
+import rospy
 from frame_accumulator import FrameAccumulator
 from leg_model import fit_live_lidar_to_tray
 import tray_config
@@ -211,6 +212,25 @@ class LegDetector:
 
         return detected_legs
 
+    def _get_sensor_pos_in_fixed_frame(self):
+        """
+        Look up the LiDAR's position in the accumulator's fixed frame (odom)
+        using TF. Returns None if TF is unavailable.
+        """
+        if self.accumulator is None:
+            return None
+        try:
+            transform = self.accumulator._tf_buffer.lookup_transform(
+                self.accumulator._fixed_frame, 'base_link',
+                rospy.Time(0), rospy.Duration(0.1)
+            )
+            t = transform.transform.translation
+            # base_link origin in odom, plus LiDAR height offset (0.2m link + 0.05m sensor)
+            return np.array([t.x, t.y, t.z + 0.25])
+        except Exception as e:
+            rospy.logwarn_throttle(2.0, f"[LegDetector] TF lookup for sensor pos failed: {e}")
+            return None
+
     def _fit_leg_model_pair(self, leg1, leg2, pair_type, is_under_tray=False):
         """
         Fit the leg model template to a pair of detected legs using Point-to-Plane ICP.
@@ -233,13 +253,21 @@ class LegDetector:
             icp_leg1 = {'center': leg1['center'], 'pcd': leg1['pcd_3d']}
             icp_leg2 = {'center': leg2['center'], 'pcd': leg2['pcd_3d']}
 
-            final_x, final_y, final_yaw, transform = fit_live_lidar_to_tray(
+            sensor_pos = self._get_sensor_pos_in_fixed_frame()
+
+            final_x, final_y, final_yaw, transform, fitness = fit_live_lidar_to_tray(
                 icp_leg1,
                 icp_leg2,
                 side=pair_type,
-                is_under_tray=is_under_tray
+                is_under_tray=is_under_tray,
+                sensor_pos=sensor_pos
             )
-            
+
+            MIN_FITNESS = 0.3
+            if fitness < MIN_FITNESS:
+                print(f"  [WARN] ICP fitness {fitness:.4f} below threshold {MIN_FITNESS}, rejecting {pair_type} pair")
+                return None
+
             return {
                 'center': np.array([final_x, final_y]),
                 'x': final_x,

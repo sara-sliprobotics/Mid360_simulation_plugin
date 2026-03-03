@@ -3,7 +3,7 @@
 import rospy
 import numpy as np
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header, String
+from std_msgs.msg import Header, String, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 import sensor_msgs.point_cloud2 as pc2
@@ -79,12 +79,17 @@ class LivoxObjectDetector:
         )
         
         # Initialize FrameAccumulator (accumulate frames with TF into fixed frame)
-        accumulator_frames = rospy.get_param('~accumulator_frames', 5)
+        accumulator_frames = rospy.get_param('~accumulator_frames', 3)
         self.accumulator = FrameAccumulator('/livox/lidar', num_frames=accumulator_frames, fixed_frame='odom')
 
         # Initialize tray and leg detectors with the shared accumulator
         self.tray_detector = LegFirstTrayDetector(accumulator=self.accumulator)
         self.leg_detector = LegDetector(accumulator=self.accumulator)
+
+        # Entering-tray mode: when True, also run leg detection and persist tray box
+        self._entering_tray = False
+        self._tracked_trays = []
+        rospy.Subscriber('/entering_tray', Bool, self._entering_tray_cb)
 
         # Subscriber - use queue_size=1 to only process latest, drop old messages
         # Large buff_size to handle large point cloud messages
@@ -105,41 +110,91 @@ class LivoxObjectDetector:
         rospy.loginfo("Tray detection: leg-based detection enabled")
         rospy.loginfo(f"Frame accumulator: {accumulator_frames} frames")
     
+    def _entering_tray_cb(self, msg):
+        if msg.data and not self._entering_tray:
+            rospy.loginfo("[TRAY TRACKING] Entering tray mode activated")
+        elif not msg.data and self._entering_tray:
+            rospy.loginfo("[TRAY TRACKING] Entering tray mode deactivated")
+            self._tracked_trays = []
+        self._entering_tray = msg.data
+
     def pointcloud_callback(self, msg):
         """Process incoming point cloud data"""
         try:
             import time
             callback_start = time.time()
-            
-            # Debug: Check incoming message timestamp and timing
-            now = rospy.Time.now()
-            pc_age = (now - msg.header.stamp).to_sec()
-            rospy.loginfo_throttle(1.0, f"Point cloud age: {pc_age:.3f}s, PC time: {msg.header.stamp.to_sec():.3f}, Now: {now.to_sec():.3f}")
-            
-            # Convert PointCloud2 to numpy array
-            convert_start = time.time()
-            points = self.pointcloud2_to_array(msg)
-            convert_time = time.time() - convert_start
-            
-            if len(points) < self.min_points:
-                rospy.logwarn_throttle(5.0, f"Too few points: {len(points)}")
-                return
-            
-            # Detect walls using wall detector
-            wall_start = time.time()
-            walls = self.wall_detector.detect(points)
-            wall_time = time.time() - wall_start
-            
-            # Detect trucks from wall pairs
-            truck_start = time.time()
-            trucks = self.truck_detector.detect(walls)
-            truck_time = time.time() - truck_start
-            
-            # Detect persons using person detector
-            person_start = time.time()
-            persons = self.person_detector.detect(self.numpy_to_open3d(points))
-            person_time = time.time() - person_start
-            
+
+            walls = []
+            trucks = []
+            persons = []
+            trays = []
+            legs = []
+
+            if not self._entering_tray:
+                # Normal mode: detect walls, trucks, persons, trays (no legs)
+                points = self.pointcloud2_to_array(msg)
+                if len(points) < self.min_points:
+                    rospy.logwarn_throttle(5.0, f"Too few points: {len(points)}")
+                    return
+
+                walls = self.wall_detector.detect(points)
+                trucks = self.truck_detector.detect(walls)
+                persons = self.person_detector.detect(self.numpy_to_open3d(points))
+                trays = self.tray_detector.detect(walls=walls)
+                if trays:
+                    self._tracked_trays = trays
+            else:
+                # # Entering tray mode: only detect legs, skip everything else
+                # # TEMP TEST: inject fake tray so we skip detection and go straight to legs
+                # if not self._tracked_trays:
+                #     self._tracked_trays = [{
+                #         'type': 'FAKE_TEST',
+                #         'center': np.array([0.0, -4.0, 0.38]),
+                #         'legs': [],
+                #         'orientation': np.array([0.0, -1.0, 0.0]),
+                #     }]
+                #     rospy.loginfo("[TRAY TRACKING] TEMP: Using fake tray for testing")
+
+                # If no saved tray yet, detect tray once then lock it in
+                if not self._tracked_trays:
+                    points = self.pointcloud2_to_array(msg)
+                    if len(points) < self.min_points:
+                        return
+                    walls = self.wall_detector.detect(points)
+                    detected = self.tray_detector.detect(walls=walls)
+                    if detected:
+                        self._tracked_trays = [detected[0]]  # Save only the best tray
+                        rospy.loginfo(f"[TRAY TRACKING] Tray locked: {detected[0].get('type', 'UNKNOWN')}")
+                    else:
+                        rospy.loginfo_throttle(2.0, "[TRAY TRACKING] Searching for tray...")
+                    return  # Don't visualize until tray is locked
+
+                trays = self._tracked_trays
+
+                for tray in trays:
+                    tray_center = tray['center']
+
+                    import tray_config
+                    import open3d as o3d
+
+                    inflation = 0.2
+                    half_size = max(tray_config.TRAY_FULL_LENGTH, tray_config.TRAY_FULL_WIDTH) / 2.0 + inflation
+
+                    min_bound = np.array([
+                        tray_center[0] - half_size,
+                        tray_center[1] - half_size,
+                        0.0
+                    ])
+                    max_bound = np.array([
+                        tray_center[0] + half_size,
+                        tray_center[1] + half_size,
+                        0.5
+                    ])
+
+                    tray_box = o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
+                    tray_legs = self.leg_detector.detect(box=tray_box)
+                    legs.extend(tray_legs)
+
             # Publish accumulated cloud for debugging in RViz
             acc_cloud = self.accumulator.get_accumulated_cloud()
             if acc_cloud is not None and len(acc_cloud.points) > 0:
@@ -150,63 +205,13 @@ class LivoxObjectDetector:
                 acc_msg = pc2.create_cloud_xyz32(acc_header, acc_pts)
                 self.accumulated_cloud_pub.publish(acc_msg)
 
-            # Detect trays using tray detector (accumulator provides point cloud, wall removal is internal)
-            tray_start = time.time()
-            trays = self.tray_detector.detect(walls=walls)
-            tray_time = time.time() - tray_start
-            
-            # Detect legs using leg detector within each detected tray's bounding box
-            leg_start = time.time()
-            legs = []
-
-            for tray in trays:
-                # Create an inflated bounding box around the detected tray
-                tray_center = tray['center']
-
-                # Import tray dimensions
-                import tray_config
-                import open3d as o3d
-
-                # Use the same half-size for both X and Y so the box is
-                # rotation-invariant (the tray can be at any yaw angle).
-                inflation = 0.2
-                half_size = max(tray_config.TRAY_FULL_LENGTH, tray_config.TRAY_FULL_WIDTH) / 2.0 + inflation
-
-                # Create axis-aligned bounding box around tray center
-                min_bound = np.array([
-                    tray_center[0] - half_size,
-                    tray_center[1] - half_size,
-                    0.0  # Ground level
-                ])
-                max_bound = np.array([
-                    tray_center[0] + half_size,
-                    tray_center[1] + half_size,
-                    0.5  # Above ground to capture legs
-                ])
-
-                tray_box = o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
-
-                # Detect legs within this tray's bounding box using accumulated frames
-                # No need to pass pcd since leg_detector has an accumulator
-                tray_legs = self.leg_detector.detect(box=tray_box)
-                legs.extend(tray_legs)
-
-            leg_time = time.time() - leg_start
-
-            # Publish detection results as structured data
-            publish_start = time.time()
-            self.publish_detections(walls, trucks, persons, trays, legs, msg.header)
-            publish_time = time.time() - publish_start
-
-            # Visualize detected walls, trucks, persons, and trays
-            viz_start = time.time()
-            self.visualize_detections(walls, trucks, persons, trays, legs, msg.header)
-            viz_time = time.time() - viz_start
-            
             total_time = time.time() - callback_start
 
-            rospy.loginfo_throttle(1.0, f"Processing times - Convert: {convert_time:.3f}s, Wall: {wall_time:.3f}s, Truck: {truck_time:.3f}s, Person: {person_time:.3f}s, Tray: {tray_time:.3f}s, Leg: {leg_time:.3f}s, Publish: {publish_time:.3f}s, Viz: {viz_time:.3f}s, TOTAL: {total_time:.3f}s")
-            rospy.loginfo_throttle(1.0, f"Detected {len(persons)} person(s), {len(walls)} wall(s), {len(trucks)} truck(s), {len(trays)} tray(s)")
+            # Publish and visualize
+            self.publish_detections(walls, trucks, persons, trays, legs, msg.header)
+            self.visualize_detections(walls, trucks, persons, trays, legs, msg.header)
+
+            rospy.loginfo_throttle(1.0, f"Processing: {total_time:.3f}s | trays={len(trays)} legs={len(legs)} walls={len(walls)} entering_tray={self._entering_tray}")
             
         except Exception as e:
             import traceback
@@ -346,14 +351,8 @@ class LivoxObjectDetector:
     def visualize_detections(self, walls, trucks, persons, trays, legs, header):
         """Publish visualization markers for detected walls, trucks, persons, trays, and legs"""
         marker_array = MarkerArray()
-        
-        # First, delete all previous markers
-        delete_marker = Marker()
-        delete_marker.header = header
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
-        
         marker_id = 0
+        MARKER_LIFETIME = rospy.Duration(0.5)
         
         # Visualize walls
         for i, wall in enumerate(walls):
@@ -390,7 +389,7 @@ class LivoxObjectDetector:
             wall_marker.color.g = 0.0
             wall_marker.color.b = 0.0
             wall_marker.color.a = 0.3
-            wall_marker.lifetime = rospy.Duration(0)
+            wall_marker.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(wall_marker)
             
@@ -414,7 +413,7 @@ class LivoxObjectDetector:
             wall_text.color.g = 1.0
             wall_text.color.b = 1.0
             wall_text.color.a = 1.0
-            wall_text.lifetime = rospy.Duration(0)
+            wall_text.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(wall_text)
         
@@ -461,7 +460,7 @@ class LivoxObjectDetector:
             truck_marker.color.g = 0.5
             truck_marker.color.b = 1.0
             truck_marker.color.a = 0.4
-            truck_marker.lifetime = rospy.Duration(0)
+            truck_marker.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(truck_marker)
             
@@ -484,7 +483,7 @@ class LivoxObjectDetector:
             truck_text.color.g = 1.0
             truck_text.color.b = 0.0
             truck_text.color.a = 1.0
-            truck_text.lifetime = rospy.Duration(0)
+            truck_text.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(truck_text)
         
@@ -515,7 +514,7 @@ class LivoxObjectDetector:
             person_marker.color.g = 0.0
             person_marker.color.b = 0.0
             person_marker.color.a = 0.7
-            person_marker.lifetime = rospy.Duration(0)
+            person_marker.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(person_marker)
             
@@ -538,7 +537,7 @@ class LivoxObjectDetector:
             person_text.color.g = 1.0
             person_text.color.b = 1.0
             person_text.color.a = 1.0
-            person_text.lifetime = rospy.Duration(0)
+            person_text.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(person_text)
         
@@ -598,7 +597,7 @@ class LivoxObjectDetector:
             tray_marker.color.g = 1.0
             tray_marker.color.b = 0.0
             tray_marker.color.a = 0.5
-            tray_marker.lifetime = rospy.Duration(0)
+            tray_marker.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(tray_marker)
             
@@ -621,7 +620,7 @@ class LivoxObjectDetector:
             tray_text.color.g = 1.0
             tray_text.color.b = 0.0
             tray_text.color.a = 1.0
-            tray_text.lifetime = rospy.Duration(0)
+            tray_text.lifetime = MARKER_LIFETIME
             
             marker_array.markers.append(tray_text)
         

@@ -87,7 +87,7 @@ def create_tray_face_template(side="SHORT"):
     
     return template_pcd
 
-def fit_live_lidar_to_tray(leg1, leg2, side="SHORT", is_under_tray=False):
+def fit_live_lidar_to_tray(leg1, leg2, side="SHORT", is_under_tray=False, sensor_pos=None):
     """
     Fits two pre-clustered leg point clouds to the Tray Template and extracts the final Pose.
 
@@ -96,6 +96,8 @@ def fit_live_lidar_to_tray(leg1, leg2, side="SHORT", is_under_tray=False):
         leg2: dict with 'center' (np.array) and 'pcd' (o3d.PointCloud)
         side: Either "SHORT" or "LONG" to select which template to use
         is_under_tray: If True, flips the long-side template 180 deg
+        sensor_pos: LiDAR position in the same frame as the point clouds (e.g. odom).
+                    If None, defaults to [0, 0, 0.25] (only correct near odom origin).
 
     Returns:
         final_x: Fitted tray center X position
@@ -130,31 +132,64 @@ def fit_live_lidar_to_tray(leg1, leg2, side="SHORT", is_under_tray=False):
     #    Stage B: HPR — from the remaining front-facing points, remove
     #             parts occluded by other walls (e.g. side wall hidden
     #             behind front face at oblique angles).
-    sensor_pos = np.array([0.0, 0.0, 0.1])
+    #
+    #    SKIP culling when the sensor is between the two legs.
+    #    In that case the C-shape is viewed from inside and the normal-based
+    #    culling removes the wrong faces.  We detect this by checking the
+    #    angle subtended by the two legs as seen from the sensor — if the
+    #    angle exceeds 90° the sensor must be between them.
+    if sensor_pos is None:
+        sensor_pos = np.array([0.0, 0.0, 0.25])
+    else:
+        sensor_pos = np.asarray(sensor_pos, dtype=float)
+
+    # Check if sensor is between the two legs
+    sensor_2d = sensor_pos[:2]
+    vec_to_left = left_center - sensor_2d
+    vec_to_right = right_center - sensor_2d
+    norm_left = np.linalg.norm(vec_to_left)
+    norm_right = np.linalg.norm(vec_to_right)
+    if norm_left > 1e-6 and norm_right > 1e-6:
+        cos_angle = np.dot(vec_to_left, vec_to_right) / (norm_left * norm_right)
+    else:
+        cos_angle = 1.0  # sensor on top of a leg, treat as outside
+    sensor_between_legs = cos_angle < -0.64  # angle > ~130°
+
     template_world = o3d.geometry.PointCloud(template_pcd)
     template_world.transform(guess_matrix)
     world_pts = np.asarray(template_world.points)
     world_normals = np.asarray(template_world.normals)
     pre_count = len(world_pts)
 
-    # Stage A: Backface culling
-    view_dirs = sensor_pos - world_pts
-    view_norms = np.linalg.norm(view_dirs, axis=1, keepdims=True)
-    view_dirs = view_dirs / np.clip(view_norms, 1e-8, None)
-    dots = np.sum(world_normals * view_dirs, axis=1)
-    front_mask = dots > 0.3
-    front_indices = np.where(front_mask)[0]
-    template_pcd = template_pcd.select_by_index(front_indices.tolist())
-    print(f"[ICP DEBUG] After backface cull: {len(front_indices)} / {pre_count} pts")
+    if sensor_between_legs:
+        # Sensor is between the legs — backface culling would remove visible faces.
+        # Skip backface culling but still run HPR to filter occluded points.
+        angle_deg = math.degrees(math.acos(np.clip(cos_angle, -1, 1)))
+        try:
+            _, hpr_indices = template_world.hidden_point_removal(sensor_pos.tolist(), 100)
+            template_pcd = template_pcd.select_by_index(hpr_indices)
+            print(f"[ICP DEBUG] Sensor between legs (angle={angle_deg:.0f}°), HPR only: {len(hpr_indices)} / {pre_count} pts")
+        except RuntimeError:
+            print(f"[ICP DEBUG] Sensor between legs (angle={angle_deg:.0f}°), HPR failed, using all {pre_count} pts")
+    else:
+        # Stage A: Backface culling
+        view_dirs = sensor_pos - world_pts
+        view_norms = np.linalg.norm(view_dirs, axis=1, keepdims=True)
+        view_dirs = view_dirs / np.clip(view_norms, 1e-8, None)
+        dots = np.sum(world_normals * view_dirs, axis=1)
+        front_mask = dots > 0.3
+        front_indices = np.where(front_mask)[0]
+        template_pcd = template_pcd.select_by_index(front_indices.tolist())
+        print(f"[ICP DEBUG] After backface cull: {len(front_indices)} / {pre_count} pts")
 
-    # Stage B: HPR on the front-facing subset
-    try:
-        culled_world = template_world.select_by_index(front_indices.tolist())
-        _, hpr_indices = culled_world.hidden_point_removal(sensor_pos.tolist(), 100)
-        template_pcd = template_pcd.select_by_index(hpr_indices)
-        print(f"[ICP DEBUG] After HPR: {len(hpr_indices)} / {len(front_indices)} pts")
-    except RuntimeError:
-        print("[ICP DEBUG] HPR failed (too few points), using backface-culled set")
+        # Stage B: HPR on the front-facing subset
+        try:
+            culled_world = template_world.select_by_index(front_indices.tolist())
+            _, hpr_indices = culled_world.hidden_point_removal(sensor_pos.tolist(), 100)
+            template_pcd = template_pcd.select_by_index(hpr_indices)
+            print(f"[ICP DEBUG] After HPR: {len(hpr_indices)} / {len(front_indices)} pts")
+        except RuntimeError:
+            print("[ICP DEBUG] HPR failed (too few points), using backface-culled set")
 
     # 5. Combine both leg pcds into one cloud for ICP (this is the "scene" / target)
     scene_pcd = leg1['pcd'] + leg2['pcd']
@@ -205,7 +240,7 @@ def fit_live_lidar_to_tray(leg1, leg2, side="SHORT", is_under_tray=False):
     print(f"ICP Fitness Score: {reg_p2l.fitness:.4f} (Higher is better, 1.0 is perfect)")
     print(f"Final Tray Center: X={final_x:.4f}, Y={final_y:.4f}, Yaw={math.degrees(final_yaw):.2f} deg")
 
-    return final_x, final_y, final_yaw, final_transform
+    return final_x, final_y, final_yaw, final_transform, reg_p2l.fitness
 
 
 def create_leg_markers(final_transform, side, header, ns="fitted_legs", marker_id_start=0):

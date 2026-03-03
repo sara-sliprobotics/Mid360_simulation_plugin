@@ -64,6 +64,7 @@ catkin_install_python(PROGRAMS
   scripts/frame_accumulator.py
   scripts/tray_config.py
   scripts/oscillate_model.py
+  scripts/oscillate_model_xy.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

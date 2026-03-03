@@ -1,0 +1,54 @@
+<?xml version="1.0" ?>
+<launch>
+
+	<!-- Set Gazebo model path to include our custom models -->
+	<env name="GAZEBO_MODEL_PATH" value="$(find livox_laser_simulation)/models:$(optenv GAZEBO_MODEL_PATH)" />
+
+	<!-- Sensor model and initial position -->
+	<arg name="UAV_model" value="$(find livox_laser_simulation)/models/sensors_only/model.sdf" />
+
+	<arg name="x" value="0" />
+	<arg name="y" value="0" />
+	<arg name="z" value="0" />
+
+	<!-- Tray test world (same tray at 0, -4, 0) -->
+	<arg name="world" default="$(find livox_laser_simulation)/worlds/tray_test.world" />
+
+	<include file="$(find gazebo_ros)/launch/empty_world.launch">
+		<arg name="world_name" value="$(arg world)"/>
+		<arg name="paused" value="false"/>
+		<arg name="use_sim_time" value="true"/>
+		<arg name="gui" value="true"/>
+		<arg name="headless" value="false"/>
+		<arg name="debug" value="false"/>
+		<arg name="verbose" value="true"/>
+	</include>
+
+	<!-- RViz -->
+	<node name="rviz" pkg="rviz" type="rviz" args="-d $(find livox_laser_simulation)/rviz/test_pattern.rviz" />
+
+	<!-- Spawn the sensor model -->
+	<node name="spawn_model" pkg="gazebo_ros" type="spawn_model" respawn="false" output="screen"
+		args="-file $(arg UAV_model) -x $(arg x) -y $(arg y) -z $(arg z) -sdf -model iris_demo" />
+
+	<!-- Move lidar from Y=-2 to Y=-1.5 (just past front legs at Y≈-1.83) -->
+	<node name="oscillate_model" pkg="livox_laser_simulation" type="oscillate_model_xy.py" output="screen">
+		<param name="x_min" value="0.0" />
+		<param name="x_max" value="0.0" />
+		<param name="y_min" value="-3.5" />
+		<param name="y_max" value="2" />
+		<param name="period" value="50.0" />
+		<param name="phase_offset" value="0.0" />
+	</node>
+
+	<!-- Object detection node (tray detection enabled, entering tray mode on) -->
+	<node name="livox_object_detector" pkg="livox_laser_simulation" type="object_detection.py" output="screen">
+		<param name="min_points" value="50" />
+		<param name="accumulator_frames" value="5" />
+	</node>
+
+	<!-- Publish entering_tray=true so leg detection + tray box persistence are active -->
+	<node name="entering_tray_flag" pkg="rostopic" type="rostopic"
+		args="pub -l /entering_tray std_msgs/Bool 'data: true'" />
+
+</launch>
