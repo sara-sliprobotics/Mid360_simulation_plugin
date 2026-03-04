@@ -162,15 +162,11 @@ def fit_live_lidar_to_tray(leg1, leg2, side="SHORT", is_under_tray=False, sensor
     pre_count = len(world_pts)
 
     if sensor_between_legs:
-        # Sensor is between the legs — backface culling would remove visible faces.
-        # Skip backface culling but still run HPR to filter occluded points.
+        # Sensor is between the legs — ICP is unreliable from this viewpoint.
+        # Return None to signal the caller to use the last good detection.
         angle_deg = math.degrees(math.acos(np.clip(cos_angle, -1, 1)))
-        try:
-            _, hpr_indices = template_world.hidden_point_removal(sensor_pos.tolist(), 100)
-            template_pcd = template_pcd.select_by_index(hpr_indices)
-            print(f"[ICP DEBUG] Sensor between legs (angle={angle_deg:.0f}°), HPR only: {len(hpr_indices)} / {pre_count} pts")
-        except RuntimeError:
-            print(f"[ICP DEBUG] Sensor between legs (angle={angle_deg:.0f}°), HPR failed, using all {pre_count} pts")
+        print(f"[ICP DEBUG] Sensor between legs (angle={angle_deg:.0f}°), skipping ICP")
+        return None, None, None, None, -1.0
     else:
         # Stage A: Backface culling
         view_dirs = sensor_pos - world_pts
@@ -194,6 +190,39 @@ def fit_live_lidar_to_tray(leg1, leg2, side="SHORT", is_under_tray=False, sensor
     # 5. Combine both leg pcds into one cloud for ICP (this is the "scene" / target)
     scene_pcd = leg1['pcd'] + leg2['pcd']
     scene_pcd, _ = scene_pcd.remove_statistical_outlier(nb_neighbors=15, std_ratio=2.0)
+
+    # 5b. Scene backface cull — per-leg hemisphere filter.
+    #     Accumulated frames may contain points from both front and back faces
+    #     of a leg as the robot drives through. For each leg, remove points on
+    #     the far side relative to the current sensor position.
+    #     Uses geometry (not normals) so it works on sparse lidar data.
+    pre_scene = len(np.asarray(scene_pcd.points))
+    scene_pts = np.asarray(scene_pcd.points)
+    keep_mask = np.ones(len(scene_pts), dtype=bool)
+    leg_radius = 0.15
+
+    for leg in [leg1, leg2]:
+        lc = leg['center'][:2]
+        sensor_dir = sensor_pos[:2] - lc
+        sensor_dir_norm = np.linalg.norm(sensor_dir)
+        if sensor_dir_norm < 1e-6:
+            continue
+        sensor_dir = sensor_dir / sensor_dir_norm
+
+        pt_dirs = scene_pts[:, :2] - lc
+        pt_dists = np.linalg.norm(pt_dirs, axis=1)
+        near_mask = pt_dists < leg_radius
+
+        pt_dir_norms = np.linalg.norm(pt_dirs, axis=1, keepdims=True)
+        pt_dirs_n = pt_dirs / np.clip(pt_dir_norms, 1e-8, None)
+        cos_angles = np.sum(pt_dirs_n * sensor_dir, axis=1)
+
+        # cos < 0 means the point is on the opposite side of the leg from the sensor
+        far_side = near_mask & (cos_angles < 0.0)
+        keep_mask &= ~far_side
+
+    scene_pcd = scene_pcd.select_by_index(np.where(keep_mask)[0].tolist())
+    print(f"[ICP DEBUG] Scene backface cull: {pre_scene} -> {len(scene_pcd.points)} pts")
 
     # ---- DEBUG ----
     t_pts = np.asarray(template_pcd.points)

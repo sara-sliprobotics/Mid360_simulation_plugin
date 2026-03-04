@@ -15,6 +15,8 @@ class LegDetector:
 
     def __init__(self, accumulator: FrameAccumulator = None):
         self.accumulator = accumulator
+        self._last_good_pose = None
+        self._last_good_detection = None  # Full detection dict for reuse
 
     def find_candidates(self, pcd, keep_3d=False):
         """
@@ -75,6 +77,37 @@ class LegDetector:
 
         # Filter by minimum point count (removes noise clusters)
         candidates = [c for c in candidates if len(c['pcd'].points) >= self.MIN_LEG_POINTS]
+
+        # Merge clusters whose centers are within MAX_LEG_SIZE — these are
+        # fragments of the same C-shaped leg split by DBSCAN (front/back faces
+        # separated by the C opening gap).
+        merged = []
+        used = set()
+        for i in range(len(candidates)):
+            if i in used:
+                continue
+            group_pcd = candidates[i]['pcd']
+            group_3d = candidates[i].get('pcd_3d')
+            for j in range(i + 1, len(candidates)):
+                if j in used:
+                    continue
+                dist = np.linalg.norm(candidates[i]['center'][:2] - candidates[j]['center'][:2])
+                if dist < self.MAX_LEG_SIZE:
+                    group_pcd = group_pcd + candidates[j]['pcd']
+                    if keep_3d and group_3d is not None and 'pcd_3d' in candidates[j]:
+                        group_3d = group_3d + candidates[j]['pcd_3d']
+                    used.add(j)
+            # Recompute center from merged cloud
+            aabb = group_pcd.get_axis_aligned_bounding_box()
+            merged_candidate = {
+                "center": aabb.get_center(),
+                "pcd": group_pcd
+            }
+            if keep_3d and group_3d is not None:
+                merged_candidate["pcd_3d"] = group_3d
+            merged.append(merged_candidate)
+            used.add(i)
+        candidates = merged
 
         return candidates
 
@@ -198,14 +231,28 @@ class LegDetector:
 
             # Fit the appropriate template (short or long side)
             pose = self._fit_leg_model_pair(leg1, leg2, pair_type)
-            
+
+            if pose == 'USE_LAST':
+                # Sensor between legs — reuse last good detection (once)
+                if self._last_good_detection:
+                    last_center = self._last_good_detection['center'][:2]
+                    too_close = any(np.linalg.norm(last_center - dc) < 1.0 for dc in detected_centers)
+                    if not too_close:
+                        detected_legs.append(self._last_good_detection)
+                        used_legs |= idx_set
+                        detected_centers.append(last_center)
+                        print(f"  ♻️ Reusing last detection ({pair_type}) - Center: {self._last_good_detection['center']}")
+                continue
+
             if pose is not None:
-                detected_legs.append({
+                detection = {
                     "pair_type": pair_type,
                     "center": pose['center'],
                     "pose": pose,
                     "legs": [leg1, leg2]
-                })
+                }
+                detected_legs.append(detection)
+                self._last_good_detection = detection
                 used_legs |= idx_set
                 detected_centers.append(pose['center'][:2])
                 print(f"  ✅ Confirmed 2-Leg Tray Side ({pair_type}) - Center: {pose['center']}")
@@ -263,18 +310,25 @@ class LegDetector:
                 sensor_pos=sensor_pos
             )
 
+            # Sensor between legs — skip ICP, use last good detection
+            if fitness < 0:
+                print(f"  [INFO] Sensor between legs, using last detection for {pair_type} pair")
+                return 'USE_LAST'
+
             MIN_FITNESS = 0.3
             if fitness < MIN_FITNESS:
                 print(f"  [WARN] ICP fitness {fitness:.4f} below threshold {MIN_FITNESS}, rejecting {pair_type} pair")
                 return None
 
-            return {
+            pose = {
                 'center': np.array([final_x, final_y]),
                 'x': final_x,
                 'y': final_y,
                 'yaw': final_yaw,
                 'transform': transform
             }
+            self._last_good_pose = pose
+            return pose
         except Exception as e:
             print(f"  [WARN] ICP fitting failed for {pair_type} pair: {e}")
             return None
